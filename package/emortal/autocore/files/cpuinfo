@@ -4,7 +4,6 @@
 
 CPUINFO_PATH="/proc/cpuinfo"
 CPUFREQ_PATH="/sys/devices/system/cpu/cpufreq"
-THERMAL_PATH="/sys/class/thermal"
 
 cpu_arch="$(awk -F ': ' '/model name/ {print $2}' "$CPUINFO_PATH" | head -n1)"
 [ -n "${cpu_arch}" ] || cpu_arch="?"
@@ -32,31 +31,10 @@ case "$DISTRIB_TARGET" in
 	;;
 esac
 
-case "$DISTRIB_TARGET" in
-"bcm27xx"/*)
-	cpu_temp="$(vcgencmd measure_temp | awk -F '=' '{print $2}' | awk -F "'" '{print $1}')°C" ;;
-"ipq40xx"/*|"ipq806x"/*|"mediatek"/*|"qualcommax"/*) ;;
-"x86"/*)
-	if [ -n "$(uci -q get "wechatpush.config.server_host")" ]; then
-		cpu_temp="$(/usr/share/wechatpush/wechatpush soc)°C"
-	elif grep -q "GenuineIntel" "/proc/cpuinfo"; then
-		cpu_temp="$(sensors "coretemp-*" 2>"/dev/null" | grep -E "(Package id |Core )" | grep -Eo "\+[0-9.]*°C" | head -n1 | tr -d "+")"
-	elif grep -q "AuthenticAMD" "/proc/cpuinfo"; then
-		cpu_temp="$(sensors "k10temp-*" 2>"/dev/null" | awk '/Tctl|Tdie/ {print $2}' | head -n1 | tr -d "+")"
-	fi
-	;;
-*)
-	[ ! -e "$THERMAL_PATH/thermal_zone0/temp" ] || \
-		cpu_temp="$(awk '{printf("%.1f°C", $0 / 1000)}' "$THERMAL_PATH/thermal_zone0/temp")"
-	;;
-esac
-
-if [ -z "$cpu_freq" ] && [ -n "$cpu_temp" ]; then
-	echo -n "$cpu_arch x $cpu_cores ($cpu_temp)"
-elif [ -z "$cpu_temp" ] && [ -n "$cpu_freq" ]; then
+# Temperature is shown in its own row via /sbin/tempinfo (getTempInfo);
+# keep the architecture line free of duplicated temperature info.
+if [ -n "$cpu_freq" ]; then
 	echo -n "$cpu_arch x $cpu_cores ($cpu_freq)"
-elif [ -n "$cpu_temp" ] && [ -n "$cpu_freq" ]; then
-	echo -n "$cpu_arch x $cpu_cores ($cpu_freq, ${cpu_temp})"
 else
 	echo -n "$cpu_arch x $cpu_cores"
 fi
