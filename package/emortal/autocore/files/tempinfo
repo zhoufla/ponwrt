@@ -29,12 +29,11 @@ ipq40xx/*)
 	;;
 esac
 
-if [ -n "$cpu_temp" ] && [ -z "$wifi_temp" ]; then
-	echo -n "CPU: $cpu_temp"
-elif [ -z "$cpu_temp" ] && [ -n "$wifi_temp" ]; then
-	echo -n "WiFi: $wifi_temp"
-elif [ -n "$cpu_temp" ] && [ -n "$wifi_temp" ]; then
-	echo -n "CPU: $cpu_temp, WiFi: $wifi_temp"
-else
-	echo -n "No temperature info"
-fi
+# Airoha PON optical frontend temperature via ponctl (SFF-8472 DDM)
+pon_temp="$(ponctl status 2>"/dev/null" | awk '/^temperature_celsius:/ {printf("%.1f°C", $2); exit}')"
+
+temp_out=""
+[ -n "$cpu_temp" ] && temp_out="CPU: $cpu_temp"
+[ -n "$wifi_temp" ] && temp_out="${temp_out:+$temp_out, }WiFi: $wifi_temp"
+[ -n "$pon_temp" ] && temp_out="${temp_out:+$temp_out, }PON: $pon_temp"
+echo -n "${temp_out:-No temperature info}"
