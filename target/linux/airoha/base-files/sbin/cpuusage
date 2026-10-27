@@ -1,0 +1,38 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 zhoufla
+#
+# CPU usage + Airoha PPE offload status for the LuCI overview page
+# ("CPU usage (%)" row). Wired into luci's getCPUUsage RPC by
+# etc/uci-defaults/992_set-ppe-load.sh, same pattern as qualcommax/qualcommbe.
+
+read -r usr sys < <(top -bn1 | awk '/^CPU:/ {print $2, $4; exit}')
+
+# /sys/kernel/debug/ppe/bind lists FOE entries currently in BND (offloaded)
+# state, one line per entry: "<index> BND <type> orig=..." with type one of
+# IPv4 5T / IPv4 3T / DS-LITE / L2B / IPv6 3T / IPv6 5T / 6RD.
+BIND_FILE="/sys/kernel/debug/ppe/bind"
+
+if [ -r "$BIND_FILE" ]; then
+	# FOE table capacity = PPE_SRAM_NUM_ENTRIES * num_ppe + PPE_DRAM_NUM_ENTRIES
+	# (airoha_ppe.c): AN7581 num_ppe=2 -> 8192*2 + 16384 = 32768,
+	#                 AN7583 num_ppe=1 -> 8192*1 + 16384 = 24576.
+	case "$(tr '\0' '\n' < /sys/firmware/devicetree/base/compatible 2>/dev/null)" in
+	*an7583*) total=24576 ;;
+	*)        total=32768 ;;
+	esac
+
+	read -r ipv4 ipv6 used < <(awk '
+		$2 == "BND" {
+			used++
+			if ($3 == "IPv4" || $3 == "DS-LITE")
+				ipv4++
+			else if ($3 == "IPv6" || $3 == "6RD")
+				ipv6++
+		}
+		END { print ipv4 + 0, ipv6 + 0, used + 0 }' "$BIND_FILE" 2>/dev/null)
+
+	echo -n "USR: ${usr:-N/A} SYS: ${sys:-N/A} PPE: ${used:-0}/${total} (IPv4: ${ipv4:-0} IPv6: ${ipv6:-0})"
+else
+	echo -n "USR: ${usr:-N/A} SYS: ${sys:-N/A}"
+fi
