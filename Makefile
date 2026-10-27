@@ -45,33 +45,10 @@ else
 
 $(toolchain/stamp-compile): $(tools/stamp-compile) $(if $(CONFIG_BUILDBOT),toolchain_rebuild_check)
 $(target/stamp-compile): $(toolchain/stamp-compile) $(tools/stamp-compile) $(BUILD_DIR)/.prepared
-$(package/stamp-compile): $(target/stamp-compile) $(package/stamp-cleanup) $(TMP_DIR)/.luci-mod-status-npu-patched
+$(package/stamp-compile): $(target/stamp-compile) $(package/stamp-cleanup)
 $(package/stamp-install): $(package/stamp-compile)
 $(target/stamp-install): $(package/stamp-compile) $(package/stamp-install)
 check: $(tools/stamp-check) $(toolchain/stamp-check) $(package/stamp-check)
-
-# Apply the local NPU status patch shipped by
-# package/utils/luci-app-airoha-npu/patches/luci-mod-status/ to the luci
-# feed checkout before packages are built. The patch application is
-# idempotent and re-runs automatically after "scripts/feeds update luci"
-# rewrites the feed checkout.
-LUCI_NPU_PATCH_DIR := package/utils/luci-app-airoha-npu/patches/luci-mod-status
-LUCI_NPU_FEED_FILE := feeds/luci/modules/luci-mod-status/htdocs/luci-static/resources/view/status/include/10_system.js
-
-$(TMP_DIR)/.luci-mod-status-npu-patched: $(wildcard $(LUCI_NPU_PATCH_DIR)/*.patch) $(wildcard $(LUCI_NPU_FEED_FILE))
-	@mkdir -p $(TMP_DIR)
-	@if [ ! -f "$(LUCI_NPU_FEED_FILE)" ]; then \
-		echo "luci-mod-status: not found in feeds, skipping NPU status patch"; \
-	elif grep -q airoha-npu "$(LUCI_NPU_FEED_FILE)"; then \
-		echo "luci-mod-status: NPU status patch already applied"; \
-	else \
-		for p in $(LUCI_NPU_PATCH_DIR)/*.patch; do \
-			git -C feeds/luci apply --directory=modules/luci-mod-status "$(TOPDIR)/$$p" \
-				&& echo "luci-mod-status: applied NPU status patch ($$p)" \
-				|| echo "WARNING: could not apply NPU status patch ($$p)" >&2; \
-		done; \
-	fi
-	@touch $@
 
 printdb:
 	@true
