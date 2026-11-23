@@ -1,0 +1,216 @@
+From: OpenWrt fix candidate
+Subject: [PATCH] net: airoha: recover RX ring after hw completion race
+
+On AN7583, hardware can write a completed RX descriptor past the
+software-posted boundary (q->head) before airoha_qdma_fill_rx_queue()
+has actually posted a fresh buffer there, as if hardware advances its
+own completion pointer independently of software's posting
+bookkeeping. Since airoha_qdma_rx_process() consumes the ring strictly
+sequentially starting at q->tail, the consumer stalls forever waiting
+on a descriptor that hardware never writes, even though real,
+completed frames are sitting further along in the ring. In practice
+this is reachable during PPPoE/DHCP negotiation bursts on the small
+shared "force to CPU" ring, and the interface silently stops receiving
+on it.
+
+Detect this without inspecting ring/descriptor memory content at all:
+REG_RX_DMA_IDX is hardware's own completion counter, independent of
+what has or hasn't been posted. If it keeps advancing across polls
+while the software consumer (tail) does not move, hardware is making
+progress the consumer can never observe - the ring is stuck. Idle
+rings, where hardware isn't advancing either, are correctly left
+alone. An earlier version of this recovery instead scanned ahead in
+the ring for a DONE descriptor and trusted its content; that caused a
+real OOM panic once it wandered into genuinely uninitialized DMA
+memory that coincidentally had the DONE bit set. Comparing a hardware
+register cannot misfire that way.
+
+Once a stall is confirmed, defer to a work item (register access here
+can sleep) that disables RX DMA, waits for it to actually go idle,
+resyncs the ring via the existing cleanup_rx_queue()/fill_rx_queue()
+pair - which only ever touches the software-owned [tail, head) window
+and rewrites both RX_CPU_IDX and RX_DMA_IDX from it - and re-enables
+RX DMA. This deliberately drops whatever was in flight on the ring
+rather than trying to identify and preserve the specific descriptor
+hardware used; a prior attempt at the latter caused a page_pool
+double-free when the assumptions about which page was safe to free
+turned out not to hold in all cases.
+
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -11,6 +11,7 @@
+ #include <linux/if_vlan.h>
+ #include <linux/pcs/pcs.h>
+ #include <linux/u64_stats_sync.h>
++#include <linux/workqueue.h>
+ #include <net/dst_metadata.h>
+ #include <net/ip6_checksum.h>
+ #include <net/page_pool/helpers.h>
+@@ -890,6 +891,47 @@
+ 	return skb;
+ }
+
++/* number of consecutive polls where hw completion (RX_DMA_IDX) advances
++ * while the sw consumer (tail) doesn't, before declaring the ring stuck
++ */
++#define AIROHA_RX_STALL_THRESHOLD	3
++
++/* Detect an RX ring where hw's own completion pointer (RX_DMA_IDX) keeps
++ * moving while the sw consumer (q->tail) doesn't - i.e. hw has written
++ * further descriptors somewhere in the ring, but the strictly sequential
++ * consumer can never reach them because the one at q->head, which it is
++ * waiting on, was never marked DONE. This happens when hw writes a
++ * completed descriptor past q->head before airoha_qdma_fill_rx_queue()
++ * has posted a fresh buffer there, decoupled from sw's own posting
++ * bookkeeping.
++ *
++ * Deliberately does not inspect ring/descriptor memory content to detect
++ * this: an earlier version scanned ahead for a DONE descriptor and trusted
++ * its content, which caused a real OOM panic after it wandered into
++ * genuinely uninitialized DMA memory that coincidentally had the DONE bit
++ * set. RX_DMA_IDX is a hw register with a well-defined value regardless of
++ * ring content, so this can't misfire on garbage memory, and idle rings
++ * (no hw progress either) are naturally left alone.
++ */
++static void airoha_qdma_rx_check_stall(struct airoha_queue *q)
++{
++	struct airoha_qdma *qdma = q->qdma;
++	int qid = q - &qdma->q_rx[0];
++	u32 dma_idx = airoha_qdma_get(qdma, REG_RX_DMA_IDX(qid),
++				      RX_RING_DMA_IDX_MASK);
++
++	if (q->stall_tail == q->tail && dma_idx != q->stall_dma_idx) {
++		if (++q->stall_count >= AIROHA_RX_STALL_THRESHOLD &&
++		    !test_and_set_bit(qid, qdma->rx_recover_mask))
++			schedule_work(&qdma->rx_recover_work);
++	} else {
++		q->stall_count = 0;
++	}
++
++	q->stall_tail = q->tail;
++	q->stall_dma_idx = dma_idx;
++}
++
+ static int airoha_qdma_rx_process(struct airoha_queue *q, int budget)
+ {
+ 	enum dma_data_direction dir = page_pool_get_dma_dir(q->page_pool);
+@@ -906,8 +948,10 @@
+ 		struct page *page;
+
+ 		desc_ctrl = le32_to_cpu(READ_ONCE(desc->ctrl));
+-		if (!(desc_ctrl & QDMA_DESC_DONE_MASK))
++		if (!(desc_ctrl & QDMA_DESC_DONE_MASK)) {
++			airoha_qdma_rx_check_stall(q);
+ 			break;
++		}
+
+ 		dma_rmb();
+
+@@ -1125,6 +1169,57 @@
+ 			FIELD_PREP(RX_RING_DMA_IDX_MASK, q->tail));
+ }
+
++static void airoha_qdma_rx_recover_work(struct work_struct *work)
++{
++	struct airoha_qdma *qdma = container_of(work, struct airoha_qdma,
++						 rx_recover_work);
++	int qid;
++
++	for_each_set_bit(qid, qdma->rx_recover_mask, AIROHA_NUM_RX_RING) {
++		struct airoha_queue *q = &qdma->q_rx[qid];
++		u32 status;
++
++		if (!q->ndesc)
++			goto next;
++
++		napi_disable(&q->napi);
++
++		airoha_qdma_clear(qdma, REG_QDMA_GLOBAL_CFG,
++				  GLOBAL_CFG_RX_DMA_EN_MASK);
++		if (read_poll_timeout(airoha_qdma_rr, status,
++				      !(status & GLOBAL_CFG_RX_DMA_BUSY_MASK),
++				      USEC_PER_MSEC, 50 * USEC_PER_MSEC, true,
++				      qdma, REG_QDMA_GLOBAL_CFG))
++			dev_warn(qdma->eth->dev,
++				 "qid=%d RX DMA busy timeout during recovery\n",
++				 qid);
++
++		/* Drop whatever is currently in flight on this ring and
++		 * re-arm it from a known-clean state. cleanup_rx_queue()
++		 * only ever touches the sw-owned [tail, head) window and
++		 * resyncs both RX_CPU_IDX and RX_DMA_IDX to it, which is
++		 * what un-wedges a ring where hw wrote past the sw head
++		 * without the consumer ever advancing - no need to figure
++		 * out which descriptor hw actually used.
++		 */
++		airoha_qdma_cleanup_rx_queue(q);
++		airoha_qdma_fill_rx_queue(q);
++
++		airoha_qdma_set(qdma, REG_QDMA_GLOBAL_CFG,
++				GLOBAL_CFG_RX_DMA_EN_MASK);
++
++		q->stall_count = 0;
++		napi_enable(&q->napi);
++		napi_schedule(&q->napi);
++
++		dev_warn_ratelimited(qdma->eth->dev,
++				     "qid=%d RX ring recovered after hw stall\n",
++				     qid);
++next:
++		clear_bit(qid, qdma->rx_recover_mask);
++	}
++}
++
+ static int airoha_qdma_init_rx(struct airoha_qdma *qdma)
+ {
+ 	int i;
+@@ -1750,6 +1845,7 @@
+ 	const char *res;
+
+ 	qdma->eth = eth;
++	INIT_WORK(&qdma->rx_recover_work, airoha_qdma_rx_recover_work);
+ 	res = devm_kasprintf(eth->dev, GFP_KERNEL, "qdma%d", id);
+ 	if (!res)
+ 		return -ENOMEM;
+@@ -1782,6 +1878,8 @@
+ {
+ 	int i;
+
++	cancel_work_sync(&qdma->rx_recover_work);
++
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_rx); i++) {
+ 		if (!qdma->q_rx[i].ndesc)
+ 			continue;
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -211,6 +211,15 @@
+ 	int buf_size;
+ 	bool txq_stopped;
+
++	/* RX hw stall detection: last REG_RX_DMA_IDX/tail snapshot taken
++	 * whenever the head-of-line descriptor isn't DONE, and how many
++	 * consecutive times hw made progress (DMA_IDX moved) while the
++	 * consumer (tail) didn't. See airoha_qdma_rx_check_stall().
++	 */
++	u32 stall_dma_idx;
++	u16 stall_tail;
++	u8 stall_count;
++
+ 	struct napi_struct napi;
+ 	struct page_pool *page_pool;
+ 	struct sk_buff *skb;
+@@ -546,6 +555,13 @@
+ 	struct airoha_queue q_tx[AIROHA_NUM_TX_RING];
+ 	struct airoha_queue q_rx[AIROHA_NUM_RX_RING];
+
++	/* recovery for RX rings whose hw completion pointer (RX_DMA_IDX)
++	 * keeps moving while the sw consumer is stuck; see
++	 * airoha_qdma_rx_check_stall() and airoha_qdma_rx_recover_work().
++	 */
++	struct work_struct rx_recover_work;
++	DECLARE_BITMAP(rx_recover_mask, AIROHA_NUM_RX_RING);
++
+ 	DECLARE_BITMAP(qos_channel_map, AIROHA_NUM_QOS_CHANNELS);
+ };
+
