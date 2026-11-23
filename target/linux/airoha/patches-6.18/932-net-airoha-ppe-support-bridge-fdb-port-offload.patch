@@ -1,0 +1,69 @@
+From: Ziwei Wu <wuziwei518@gmail.com>
+Subject: [PATCH] net: airoha: support hardware flowtable offload for bridge slave ports
+
+In OpenWrt and common router environments, LAN interfaces (such as lan1-lan4
+and wireless AP interfaces) are aggregated under a virtual bridge device
+(e.g., br-lan).
+
+When the Netfilter flowtable attempts to offload routed traffic destined for
+a LAN host, the egress net_device presented to the hardware driver is the
+bridge master device (br-lan). Previously, airoha_ppe_foe_entry_prepare()
+validated the egress net_device via airoha_is_valid_gdm_dev(). Because the
+virtual bridge device is not a physical GDM device, the driver unconditionally
+rejected the hardware flow entry with -EINVAL.
+
+As a consequence, routed downlink traffic from WAN to LAN could never be
+hardware-offloaded into the PPE flow table, causing up to 88% of incoming
+traffic to fall back onto the CPU DMA path (CDM2 and heavy softirq load),
+leading to sustained high CPU load under multi-connection workloads like BitTorrent.
+
+Fix this by resolving the bridge slave port via br_fdb_find_port() using the
+destination MAC address when netdev is a bridge master (netif_is_bridge_master).
+If a corresponding bridge slave port (such as lan1 or phy0-ap0) is found in
+the FDB, substitute netdev with the real slave net_device prior to DSA port
+and GDM device validation. If the destination MAC is not yet in the FDB,
+the flow safely falls back to CPU software routing until the bridge learns it.
+
+Signed-off-by: Ziwei Wu <wuziwei518@gmail.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -4,6 +4,9 @@
+  * Author: Lorenzo Bianconi <lorenzo@kernel.org>
+  */
+ 
++#if IS_ENABLED(CONFIG_BRIDGE)
++#include <linux/if_bridge.h>
++#endif
+ #include <linux/airoha-eth.h>
+ #include <linux/ip.h>
+ #include <linux/ipv6.h>
+@@ -462,11 +465,26 @@ static int airoha_ppe_foe_entry_prepare(struct airoha_eth *eth,
+ 					struct airoha_gdm_dev **egress_dev)
+ {
+ 	u32 qdata = FIELD_PREP(AIROHA_FOE_SHAPER_ID, 0x7f), ports_pad, val;
+-	u32 pon_tag = 0;
+-	int wlan_etype = -EINVAL, dsa_port = airoha_get_dsa_port(&netdev);
+ 	struct airoha_foe_mac_info_common *l2;
++	int wlan_etype = -EINVAL, dsa_port;
++	u32 pon_tag = 0;
+ 	u8 smac_id = 0xf;
+ 
++#if IS_ENABLED(CONFIG_BRIDGE)
++	if (netdev && netif_is_bridge_master(netdev)) {
++		struct net_device *slave_dev;
++		u16 vid = data->vlan.num ? data->vlan.hdr[data->vlan.num - 1].id : 0;
++
++		slave_dev = br_fdb_find_port(netdev, data->eth.h_dest, vid);
++		if (!slave_dev && vid)
++			slave_dev = br_fdb_find_port(netdev, data->eth.h_dest, 0);
++
++		if (slave_dev)
++			netdev = slave_dev;
++	}
++#endif
++
++	dsa_port = airoha_get_dsa_port(&netdev);
+ 	memset(hwe, 0, sizeof(*hwe));
+ 	*egress_dev = NULL;
+ 
