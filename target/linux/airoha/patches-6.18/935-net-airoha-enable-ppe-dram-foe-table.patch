@@ -1,0 +1,39 @@
+From: zhoufl <zhoufl@localhost>
+Subject: [PATCH] net: airoha: enable the PPE DRAM FOE table
+
+airoha_ppe_hw_init() programs REG_PPE_TB_HASH_CFG with the DRAM hash
+modes but leaves PPE_DRAM_TABLE_EN cleared, so the PPE only searches
+the 8192-entry SRAM table while the 16384-entry DRAM table allocated
+next to it is never used. With only 8192 effective slots, workloads
+with more than 8k concurrent connections (PCDN, bittorrent) saturate
+the table and keep churning the software path.
+
+Set PPE_DRAM_TABLE_EN so the full 24576-entry table is searched, and
+zero the DRAM region during the initial flush so stale data can never
+be interpreted as a valid binding.
+
+Signed-off-by: zhoufl <zhoufl@localhost>
+---
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -182,6 +182,7 @@
+ 			      FIELD_PREP(PPE_SRAM_TABLE_EN_MASK, 1) |
+ 			      FIELD_PREP(PPE_SRAM_HASH1_EN_MASK, 1) |
+ 			      FIELD_PREP(PPE_SRAM_HASH1_MODE_MASK, 1) |
++			      FIELD_PREP(PPE_DRAM_TABLE_EN_MASK, 1) |
+ 			      FIELD_PREP(PPE_DRAM_HASH1_MODE_MASK, 3));
+ 
+ 		airoha_fe_rmw(eth, REG_PPE_TB_CFG(i),
+@@ -1613,6 +1614,12 @@
+ 			return err;
+ 	}
+ 
++	/* The PPE also searches the DRAM FOE table: make sure stale data
++	 * can never be interpreted as a valid binding.
++	 */
++	memset(hwe + sram_num_entries, 0,
++	       PPE_DRAM_NUM_ENTRIES * sizeof(*hwe));
++
+ 	return 0;
+ }
+ 
