@@ -1,0 +1,32 @@
+Subject: [PATCH] net: airoha: lower the default PPE bind rate threshold
+
+airoha_ppe_hw_init() programs PPE_BIND_RATE to 0x1e (30), the
+packets-per-second threshold at which the PPE promotes a flow entry from
+the UNBIND to the BIND state. At 30 most short-lived UDP sessions never
+reach the threshold before they expire, so they stay on the CPU path and
+keep the PCDN workload in softirq.
+
+Measurements on the Nokia XG-040G-MF under a steady PCDN upload show that
+lowering the threshold to 4 raises the bound share of the flow table from
+~23% to ~64% and the offloaded share of PON egress frames from ~67% to
+~85%, while CPU utilization drops from 29% to 21-24%. Going all the way
+down to 1 pushes the table past 76% occupancy, where bursts of short
+sessions can evict the long-lived flows that carry most of the bytes, so
+stay at 4 and keep headroom for transient connection churn.
+
+The value is still exposed through ppe/bind_rate for runtime tuning.
+
+---
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -208,8 +208,8 @@
+ 		airoha_fe_rmw(eth, REG_PPE_BIND_RATE(i),
+ 			      PPE_BIND_RATE_L2B_BIND_MASK |
+ 			      PPE_BIND_RATE_BIND_MASK,
+-			      FIELD_PREP(PPE_BIND_RATE_L2B_BIND_MASK, 0x1e) |
+-			      FIELD_PREP(PPE_BIND_RATE_BIND_MASK, 0x1e));
++			      FIELD_PREP(PPE_BIND_RATE_L2B_BIND_MASK, 4) |
++			      FIELD_PREP(PPE_BIND_RATE_BIND_MASK, 4));
+ 
+ 		airoha_fe_wr(eth, REG_PPE_HASH_SEED(i), PPE_HASH_SEED);
+ 		airoha_fe_clear(eth, REG_PPE_PPE_FLOW_CFG(i),
