@@ -6,13 +6,13 @@ the UNBIND to the BIND state. At 30 most short-lived UDP sessions never
 reach the threshold before they expire, so they stay on the CPU path and
 keep the PCDN workload in softirq.
 
-Measurements on the Nokia XG-040G-MF under a steady PCDN upload show that
-lowering the threshold to 4 raises the bound share of the flow table from
-~23% to ~64% and the offloaded share of PON egress frames from ~67% to
-~85%, while CPU utilization drops from 29% to 21-24%. Going all the way
-down to 1 pushes the table past 76% occupancy, where bursts of short
-sessions can evict the long-lived flows that carry most of the bytes, so
-stay at 4 and keep headroom for transient connection churn.
+On a 24K FOE table, lowering the threshold to 4 struck a balance between
+offload share and headroom. After expanding AN7583 DRAM FOE to 64K
+(65536 entries), A/B testing under live PCDN load on the Nokia XG-040G-MF
+(4 vs 2 vs 1) shows that 2 gives the lowest overall CPU usage (18.22% vs
+20.85% at 4 and 19.30% at 1), cuts r0e HIT_UNBIND packets by 55.6%,
+raises RX HW offload from 70.65% to 76.15%, and keeps bound entries at
+~25.9k (~40% of 64K) without the single-packet flowtable churn seen at 1.
 
 The value is still exposed through ppe/bind_rate for runtime tuning.
 
@@ -25,8 +25,8 @@ The value is still exposed through ppe/bind_rate for runtime tuning.
  			      PPE_BIND_RATE_BIND_MASK,
 -			      FIELD_PREP(PPE_BIND_RATE_L2B_BIND_MASK, 0x1e) |
 -			      FIELD_PREP(PPE_BIND_RATE_BIND_MASK, 0x1e));
-+			      FIELD_PREP(PPE_BIND_RATE_L2B_BIND_MASK, 4) |
-+			      FIELD_PREP(PPE_BIND_RATE_BIND_MASK, 4));
++			      FIELD_PREP(PPE_BIND_RATE_L2B_BIND_MASK, 2) |
++			      FIELD_PREP(PPE_BIND_RATE_BIND_MASK, 2));
  
  		airoha_fe_wr(eth, REG_PPE_HASH_SEED(i), PPE_HASH_SEED);
  		airoha_fe_clear(eth, REG_PPE_PPE_FLOW_CFG(i),
