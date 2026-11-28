@@ -6,33 +6,36 @@
 # ("CPU usage (%)" row). Wired into luci's getCPUUsage RPC by
 # etc/uci-defaults/992_set-ppe-load.sh, same pattern as qualcommax/qualcommbe.
 
-read -r usr sys < <(top -bn1 | awk '/^CPU:/ {print $2, $4; exit}')
+set -- $(top -bn1 | awk '/^CPU:/ {print $2, $4; exit}')
+usr=$1
+sys=$2
 
-# /sys/kernel/debug/ppe/bind lists FOE entries currently in BND (offloaded)
-# state, one line per entry: "<index> BND <type> orig=..." with type one of
-# IPv4 5T / IPv4 3T / DS-LITE / L2B / IPv6 3T / IPv6 5T / 6RD.
-BIND_FILE="/sys/kernel/debug/ppe/bind"
+# Hardware onload ratio for the PON uplink.
+#
+# pon0 tx_packets is the GDM counter of frames actually handed to the PON MAC,
+# including the ones the PPE forwards by itself. tx_packets_submitted counts
+# only the frames the CPU queue submitted. The difference is the share the
+# PPE forwarded without the CPU, which is the number worth showing.
+#
+# Do NOT derive this from ppe/diag: that histogram only sees the packets that
+# were delivered to the CPU in the first place, so its BND share (typically
+# 1-3%) measures exception traffic, not offload. And do not walk ppe/bind or
+# ppe/entries either: both take bottom halves down once per entry (~2.2s on a
+# 20k-entry table) and stall softirqs while the PPE is busy.
+DATAPATH="/sys/kernel/debug/airoha-xpon-pon0/datapath"
+TX_FILE="/sys/class/net/pon0/statistics/tx_packets"
 
-if [ -r "$BIND_FILE" ]; then
-	# FOE table capacity = PPE_SRAM_NUM_ENTRIES * num_ppe + PPE_DRAM_NUM_ENTRIES
-	# (airoha_ppe.c): AN7581 num_ppe=2 -> 8192*2 + 16384 = 32768,
-	#                 AN7583 num_ppe=1 -> 8192*1 + 16384 = 24576.
-	case "$(tr '\0' '\n' < /sys/firmware/devicetree/base/compatible 2>/dev/null)" in
-	*an7583*) total=24576 ;;
-	*)        total=32768 ;;
+if [ -r "$DATAPATH" ] && [ -r "$TX_FILE" ]; then
+	tx=$(cat "$TX_FILE" 2>/dev/null)
+	sub=$(awk '/^tx_packets_submitted:/{print $2; exit}' "$DATAPATH" 2>/dev/null)
+	case "$tx$sub" in
+	''|*[!0-9]*) ;;
+	*) [ "$tx" -gt 0 ] && ratio=$(( (tx - sub) * 100 / tx )) ;;
 	esac
+fi
 
-	read -r ipv4 ipv6 used < <(awk '
-		$2 == "BND" {
-			used++
-			if ($3 == "IPv4" || $3 == "DS-LITE")
-				ipv4++
-			else if ($3 == "IPv6" || $3 == "6RD")
-				ipv6++
-		}
-		END { print ipv4 + 0, ipv6 + 0, used + 0 }' "$BIND_FILE" 2>/dev/null)
-
-	echo -n "USR: ${usr:-N/A} SYS: ${sys:-N/A} PPE: ${used:-0}/${total} (IPv4: ${ipv4:-0} IPv6: ${ipv6:-0})"
+if [ -n "$ratio" ]; then
+	echo -n "USR: ${usr:-N/A} SYS: ${sys:-N/A} PPE: ${ratio}% hw"
 else
 	echo -n "USR: ${usr:-N/A} SYS: ${sys:-N/A}"
 fi
