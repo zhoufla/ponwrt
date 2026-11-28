@@ -1,0 +1,95 @@
+Subject: [PATCH] net: airoha: expand AN7583 DRAM FOE table to 64K mode
+
+Match stock hw_nat.ko (FOE_NUM=56) by programming PPE_DRAM_TB_NUM to 64K
+mode (shift=6) and sizing the AN7583 FOE table buffer to the full 16-bit
+hardware index space (65536 entries, 5 MiB via DMA_CMA). Guard hash==0xffff
+in airoha_ppe_check_skb() so it never collides with the unbound sentinel.
+
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.h	2026-11-28 22:15:40.971176439 +0800
++++ b/drivers/net/ethernet/airoha/airoha_eth.h	2026-11-28 22:15:40.971249237 +0800
+@@ -74,6 +74,7 @@
+  * hole on the single-PPE AN7583.
+  */
+ #define PPE_DRAM_IDX_BASE		0x4000
++#define PPE_AN7583_DRAM_NUM_ENTRIES	(64 * 1024)
+ #define PPE_ENTRY_SIZE			80
+ #define PPE_RAM_NUM_ENTRIES_SHIFT(_n)	(__ffs((_n) >> 10))
+ 
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c	2026-11-28 22:15:40.971309435 +0800
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c	2026-11-28 22:15:40.971378933 +0800
+@@ -72,10 +72,22 @@
+ 	return PPE_SRAM_NUM_ENTRIES * eth->soc->num_ppe;
+ }
+ 
++static u32 airoha_ppe_get_dram_num_entries(struct airoha_ppe *ppe)
++{
++	return ppe->eth->soc->num_ppe == 1 ? PPE_AN7583_DRAM_NUM_ENTRIES
++					   : PPE_DRAM_NUM_ENTRIES;
++}
++
+ u32 airoha_ppe_get_total_num_entries(struct airoha_ppe *ppe)
+ {
+ 	u32 sram_num_entries = airoha_ppe_get_total_sram_num_entries(ppe);
+ 
++	/* Single-PPE AN7583 uses 64K DRAM table mode matching stock FOE_NUM=56,
++	 * covering the entire 16-bit FOE index space (0x0000-0xffff).
++	 */
++	if (ppe->eth->soc->num_ppe == 1)
++		return PPE_AN7583_DRAM_NUM_ENTRIES;
++
+ 	/* Size the table for the hardware index space, not for the number of
+ 	 * usable entries: the PPE indexes the DRAM table relative to
+ 	 * REG_PPE_TB_BASE, so an undersized table makes it write entries past
+@@ -154,7 +166,7 @@
+ 
+ 	sram_num_entries = airoha_ppe_get_total_sram_num_entries(ppe);
+ 	sram_tb_size = sram_num_entries * sizeof(struct airoha_foe_entry);
+-	dram_num_entries = PPE_RAM_NUM_ENTRIES_SHIFT(PPE_DRAM_NUM_ENTRIES);
++	dram_num_entries = PPE_RAM_NUM_ENTRIES_SHIFT(airoha_ppe_get_dram_num_entries(ppe));
+ 
+ 	sram_num_stats_entries = airoha_ppe_get_num_stats_entries(ppe);
+ 	if (sram_num_stats_entries > 0)
+@@ -891,11 +903,17 @@
+ 	struct airoha_foe_entry *foe = ppe->foe;
+ 	u32 used = 0, bound = 0, i;
+ 
+-	/* The PPE indexes one flat space: SRAM entries first, then the DRAM
+-	 * table at PPE_DRAM_IDX_BASE. The gap in between is never written by
+-	 * the hardware on a single-PPE SoC, so it must not count as usable.
+-	 */
+-	usage->total = sram_num_entries + PPE_DRAM_NUM_ENTRIES;
++	u32 dram_start, dram_end;
++
++	if (ppe->eth->soc->num_ppe == 1) {
++		dram_start = sram_num_entries;
++		dram_end = PPE_AN7583_DRAM_NUM_ENTRIES;
++		usage->total = PPE_AN7583_DRAM_NUM_ENTRIES;
++	} else {
++		dram_start = PPE_DRAM_IDX_BASE;
++		dram_end = PPE_DRAM_IDX_BASE + PPE_DRAM_NUM_ENTRIES;
++		usage->total = sram_num_entries + PPE_DRAM_NUM_ENTRIES;
++	}
+ 
+ 	for (i = 0; i < sram_num_entries; i++) {
+ 		u32 ib1 = READ_ONCE(foe[i].ib1);
+@@ -910,8 +928,7 @@
+ 			cond_resched();
+ 	}
+ 
+-	for (i = PPE_DRAM_IDX_BASE;
+-	     i < PPE_DRAM_IDX_BASE + PPE_DRAM_NUM_ENTRIES; i++) {
++	for (i = dram_start; i < dram_end; i++) {
+ 		u32 ib1 = READ_ONCE(foe[i].ib1);
+ 		u32 state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, ib1);
+ 
+@@ -2263,7 +2280,8 @@
+ 	u32 ppe_hash_mask = airoha_ppe_get_total_num_entries(ppe) - 1;
+ 	u16 now, diff;
+ 
+-	if (hash > ppe_hash_mask)
++	/* 0xffff is reserved as the unbound sentinel in struct airoha_flow_table_entry. */
++	if (hash > ppe_hash_mask || hash == 0xffff)
+ 		return;
+ 
+ 	now = (u16)jiffies;
