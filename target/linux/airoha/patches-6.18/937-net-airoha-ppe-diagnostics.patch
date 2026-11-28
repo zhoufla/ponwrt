@@ -1,0 +1,1217 @@
+Subject: [PATCH] net: airoha: PPE diagnostics for the PON uplink (debugfs)
+
+NOT FOR UPSTREAM - diagnostic build for XG-040G-MF.
+
+Adds debugfs below /sys/kernel/debug/ppe/:
+- diag:    per-ingress histogram of RX PPE cpu reasons and of the FOE
+           entry state at the reported hash (hardware readback for SRAM,
+           sampled 1/4); write 0/1 to disable/enable, reset to clear
+- trace:   capture up to N packets matching a src/dst/proto filter with
+           FOE words, descriptor msg0/msg1 and the frame head. The IPv4
+           header is located by ethertype so 802.1Q-tagged and PPPoE
+           frames coming from the PON are matched as well
+- reg:     single FE register read ("<off>") / modify ("<off> <mask> <val>")
+- regdump: PPE/GDM/CDM configuration registers and GDM hardware MIB counters
+- foe:     read ("<hash>") or patch ("<hash> <word> <mask> <val>") a FOE
+- npu_init: re-run the NPU HWNAT init with explicit init_info
+           ("<wan_mode> <ppe_type> <wan_sel> <max_packet> <cds>
+             <xpon_hal_api> <wan_xsi> <ct_joyme4>") or "deinit"
+- npu_fw:  load another NPU firmware pair from /lib/firmware/ and reboot
+           the NPU cores
+
+airoha_npu_ppe_init() now shares its mailbox code with the npu_init knob
+so wan_mode (hardwired to QDMA_WAN_ETHER) can be varied at runtime.
+
+Signed-off-by: zhoufla <zhoufla@users.noreply.github.com>
+---
+diff -ruN T_base/drivers/net/ethernet/airoha/airoha_eth.c T_new/drivers/net/ethernet/airoha/airoha_eth.c
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1152,6 +1152,8 @@
+ 			skb_set_hash(q->skb, jhash_1word(hash, 0),
+ 				     PKT_HASH_TYPE_L4);
+ 
++		airoha_ppe_diag_rx(eth->ppe, dev, q->skb, msg0, msg1);
++
+ 		reason = FIELD_GET(AIROHA_RXD4_PPE_CPU_REASON, msg1);
+ 		if (reason == PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED)
+ 			airoha_ppe_check_skb(&eth->ppe->dev, q->skb, hash,
+diff -ruN T_base/drivers/net/ethernet/airoha/airoha_eth.h T_new/drivers/net/ethernet/airoha/airoha_eth.h
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -740,6 +740,40 @@
+ #define AIROHA_RXD4_PPE_CPU_REASON	GENMASK(20, 16)
+ #define AIROHA_RXD4_FOE_ENTRY		GENMASK(15, 0)
+ 
++/* NPU HWNAT init parameters, see airoha_npu.c */
++enum {
++	QDMA_WAN_ETHER = 1,
++	QDMA_WAN_PON_XDSL,
++};
++#define PPE_TYPE_L2B_IPV4		2
++#define PPE_TYPE_L2B_IPV4_IPV6	3
++
++#define AIROHA_DIAG_NUM_KEYS		8	/* gdm port x {lan, pon} */
++#define AIROHA_DIAG_NUM_REASONS		32
++#define AIROHA_DIAG_NUM_STATES		6	/* foe state, no hash, skipped */
++#define AIROHA_DIAG_TRACE_SZ		256
++#define AIROHA_DIAG_TRACE_HEAD		48
++
++struct airoha_diag_rec {
++	u32 ms;
++	u32 hash:16;
++	u32 reason:5;
++	u32 state:3;
++	u32 key:4;
++	u32 len;
++	u8 proto;
++	u8 rsv[3];
++	u16 sport;
++	u16 dport;
++	u32 ib1;
++	u32 ib2;
++	u32 msg0;
++	u32 msg1;
++	__be32 saddr;
++	__be32 daddr;
++	u8 head[AIROHA_DIAG_TRACE_HEAD];
++};
++
+ struct airoha_ppe {
+ 	struct airoha_ppe_dev dev;
+ 	struct airoha_eth *eth;
+@@ -756,6 +790,15 @@
+ 	dma_addr_t foe_stats_dma;
+ 
+ 	struct dentry *debugfs_dir;
++
++	u32 diag_en;
++	u32 reg_off;
++	u32 trace_saddr;
++	u32 trace_daddr;
++	u32 trace_proto;
++	u32 trace_left;
++	u32 trace_idx;
++	struct airoha_diag_rec *trace;
+ };
+ 
+ struct airoha_eth_soc_data {
+@@ -885,6 +928,26 @@
+ void airoha_ppe_foe_entry_get_stats(struct airoha_ppe *ppe, u32 hash,
+ 				    struct airoha_foe_stats64 *stats);
+ 
++struct airoha_flow_table_entry;
++struct seq_file;
++
++/* PPE diagnostics (debugfs) */
++void airoha_ppe_diag_rx(struct airoha_ppe *ppe, struct airoha_gdm_dev *dev,
++			struct sk_buff *skb, u32 msg0, u32 msg1);
++void airoha_ppe_diag_reset(void);
++void airoha_ppe_diag_show(struct seq_file *m);
++void airoha_ppe_diag_trace_show(struct seq_file *m);
++int airoha_ppe_diag_npu_init(struct airoha_ppe *ppe,
++			     const struct airoha_npu_hwnat_args *args,
++			     bool deinit);
++int airoha_ppe_diag_npu_fw(struct airoha_ppe *ppe, const char *rv32_name,
++			   const char *data_name);
++int airoha_ppe_diag_reg_write(struct airoha_ppe *ppe, u32 off, u32 mask,
++			      u32 val);
++int airoha_ppe_diag_foe_read(struct airoha_ppe *ppe, u32 hash, u32 *words);
++int airoha_ppe_diag_foe_write(struct airoha_ppe *ppe, u32 hash, u32 word,
++			      u32 mask, u32 val);
++
+ #ifdef CONFIG_DEBUG_FS
+ int airoha_ppe_debugfs_init(struct airoha_ppe *ppe);
+ #else
+diff -ruN T_base/drivers/net/ethernet/airoha/airoha_npu.c T_new/drivers/net/ethernet/airoha/airoha_npu.c
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -110,11 +110,6 @@
+ 	PPE_SRAM_RESET_VAL,
+ };
+ 
+-enum {
+-	QDMA_WAN_ETHER = 1,
+-	QDMA_WAN_PON_XDSL,
+-};
+-
+ struct airoha_npu_fw {
+ 	const char *name;
+ 	int max_size;
+@@ -362,7 +357,8 @@
+ 	return IRQ_HANDLED;
+ }
+ 
+-static int airoha_npu_ppe_init(struct airoha_npu *npu)
++static int airoha_npu_ppe_hwnat_init(struct airoha_npu *npu,
++				     const struct airoha_npu_hwnat_args *args)
+ {
+ 	struct ppe_mbox_data *ppe_data;
+ 	int err;
+@@ -373,8 +369,14 @@
+ 
+ 	ppe_data->func_type = NPU_OP_SET;
+ 	ppe_data->func_id = PPE_FUNC_SET_WAIT_HWNAT_INIT;
+-	ppe_data->init_info.ppe_type = PPE_TYPE_L2B_IPV4_IPV6;
+-	ppe_data->init_info.wan_mode = QDMA_WAN_ETHER;
++	ppe_data->init_info.cds = args->cds;
++	ppe_data->init_info.xpon_hal_api = args->xpon_hal_api;
++	ppe_data->init_info.wan_xsi = args->wan_xsi;
++	ppe_data->init_info.ct_joyme4 = args->ct_joyme4;
++	ppe_data->init_info.max_packet = args->max_packet;
++	ppe_data->init_info.ppe_type = args->ppe_type;
++	ppe_data->init_info.wan_mode = args->wan_mode;
++	ppe_data->init_info.wan_sel = args->wan_sel;
+ 
+ 	err = airoha_npu_send_msg(npu, NPU_FUNC_PPE, ppe_data,
+ 				  sizeof(*ppe_data));
+@@ -383,6 +385,97 @@
+ 	return err;
+ }
+ 
++static int airoha_npu_ppe_init(struct airoha_npu *npu)
++{
++	struct airoha_npu_hwnat_args args = {
++		.ppe_type = PPE_TYPE_L2B_IPV4_IPV6,
++		.wan_mode = QDMA_WAN_ETHER,
++	};
++
++	return airoha_npu_ppe_hwnat_init(npu, &args);
++}
++
++static int airoha_npu_wlan_msg_get(struct airoha_npu *npu, int ifindex,
++				   enum airoha_npu_wlan_get_cmd func_id,
++				   void *data, int data_len, gfp_t gfp);
++
++/* Replace the running NPU firmware with images looked up in the firmware
++ * search path and reboot the NPU cores. The PPE must be initialized again
++ * afterwards.
++ */
++static int airoha_npu_fw_reload(struct airoha_npu *npu, const char *rv32_name,
++				const char *data_name)
++{
++	struct resource *reg, mem;
++	void __iomem *sram, *code;
++	u32 val;
++	int ret, i;
++
++	ret = of_reserved_mem_region_to_resource(npu->dev->of_node, 0, &mem);
++	if (ret)
++		return ret;
++
++	reg = platform_get_resource(to_platform_device(npu->dev),
++				   IORESOURCE_MEM, 0);
++	if (!reg)
++		return -EINVAL;
++
++	code = ioremap(mem.start, resource_size(&mem));
++	if (!code)
++		return -ENOMEM;
++
++	sram = ioremap(reg->start, resource_size(reg));
++	if (!sram) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	ret = airoha_npu_load_firmware(npu->dev, code, rv32_name,
++				       NPU_EN7581_FIRMWARE_RV32_MAX_SIZE);
++	if (ret)
++		goto out_sram;
++
++	ret = airoha_npu_load_firmware(npu->dev, sram + REG_NPU_LOCAL_SRAM,
++				       data_name,
++				       NPU_EN7581_FIRMWARE_DATA_MAX_SIZE);
++out_sram:
++	iounmap(sram);
++	if (ret)
++		goto out;
++
++	/* enable NPU cores, see airoha_npu_probe() */
++	regmap_write(npu->regmap, REG_CR_NPU_MIB(10),
++		     mem.start + NPU_EN7581_FIRMWARE_RV32_MAX_SIZE);
++	regmap_write(npu->regmap, REG_CR_NPU_MIB(11), 0x40000); /* SRAM 256K */
++	regmap_write(npu->regmap, REG_CR_NPU_MIB(12), 0);
++	regmap_write(npu->regmap, REG_CR_NPU_MIB(21), 1);
++	msleep(100);
++
++	for (i = 0; i < NPU_NUM_CORES; i++)
++		regmap_write(npu->regmap, REG_CR_BOOT_BASE(i), mem.start);
++	usleep_range(1000, 2000);
++
++	regmap_write(npu->regmap, REG_CR_BOOT_CONFIG, 0xff);
++	regmap_write(npu->regmap, REG_CR_BOOT_TRIGGER, 0x1);
++	msleep(100);
++
++	ret = airoha_npu_wlan_msg_get(npu, 0, WLAN_FUNC_GET_WAIT_NPU_VERSION,
++				      &val, sizeof(val), GFP_KERNEL);
++	if (ret) {
++		dev_err(npu->dev, "NPU did not answer after firmware reload\n");
++		goto out;
++	}
++
++	dev_info(npu->dev, "NPU fw reloaded (%s + %s): version %d.%d\n",
++		 rv32_name, data_name, (val >> 16) & 0xffff, val & 0xffff);
++	ret = 0;
++
++out:
++	iounmap(code);
++
++	return ret;
++}
++
+ static int airoha_npu_ppe_deinit(struct airoha_npu *npu)
+ {
+ 	struct ppe_mbox_data *ppe_data;
+@@ -743,6 +836,8 @@
+ 	npu->dev = dev;
+ 	npu->ops.ppe_init = airoha_npu_ppe_init;
+ 	npu->ops.ppe_deinit = airoha_npu_ppe_deinit;
++	npu->ops.ppe_hwnat_init = airoha_npu_ppe_hwnat_init;
++	npu->ops.fw_reload = airoha_npu_fw_reload;
+ 	npu->ops.ppe_init_stats = airoha_npu_ppe_stats_setup;
+ 	npu->ops.ppe_flush_sram_entries = airoha_npu_ppe_flush_sram_entries;
+ 	npu->ops.ppe_foe_commit_entry = airoha_npu_foe_commit_entry;
+diff -ruN T_base/drivers/net/ethernet/airoha/airoha_ppe.c T_new/drivers/net/ethernet/airoha/airoha_ppe.c
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -11,6 +11,7 @@
+ #include <linux/ip.h>
+ #include <linux/ipv6.h>
+ #include <linux/of_platform.h>
++#include <linux/percpu.h>
+ #include <linux/platform_device.h>
+ #include <linux/rhashtable.h>
+ #include <net/ipv6.h>
+@@ -1666,6 +1667,477 @@
+ 	return err;
+ }
+ 
++/* --- diagnostics ------------------------------------------------------- */
++
++#define AIROHA_DIAG_NO_HASH              4
++#define AIROHA_DIAG_SKIPPED              5
++
++struct airoha_rx_diag {
++	u64 pkts[AIROHA_DIAG_NUM_KEYS][AIROHA_DIAG_NUM_REASONS];
++	u64 bytes[AIROHA_DIAG_NUM_KEYS][AIROHA_DIAG_NUM_REASONS];
++	u64 states[AIROHA_DIAG_NUM_KEYS][AIROHA_DIAG_NUM_REASONS]
++		[AIROHA_DIAG_NUM_STATES];
++	u32 seq;
++};
++
++static DEFINE_PER_CPU(struct airoha_rx_diag, airoha_rx_diag);
++
++/* Reason names follow mtk_ppe.h (same PPE IP). */
++static const char *const airoha_diag_reason_str[AIROHA_DIAG_NUM_REASONS] = {
++	[0x00] = "none",
++	[0x01] = "0x01",
++	[0x02] = "TTL_EXCEEDED",
++	[0x03] = "OPTION_HEADER",
++	[0x04] = "0x04",
++	[0x05] = "0x05",
++	[0x06] = "0x06",
++	[0x07] = "NO_FLOW",
++	[0x08] = "IPV4_FRAG",
++	[0x09] = "IPV4_DSLITE_FRAG",
++	[0x0a] = "IPV4_DSLITE_NO_TCP_UDP",
++	[0x0b] = "IPV6_6RD_NO_TCP_UDP",
++	[0x0c] = "TCP_FIN_SYN_RST",
++	[0x0d] = "UN_HIT",
++	[0x0e] = "HIT_UNBIND",
++	[0x0f] = "HIT_UNBIND_RATE_REACHED",
++	[0x10] = "HIT_BIND_TCP_FIN",
++	[0x11] = "HIT_TTL_1",
++	[0x12] = "HIT_BIND_VLAN_VIOLATION",
++	[0x13] = "KEEPALIVE_UC_OLD_HDR",
++	[0x14] = "KEEPALIVE_MC_NEW_HDR",
++	[0x15] = "KEEPALIVE_DUP_OLD_HDR",
++	[0x16] = "HIT_BIND_FORCE_CPU",
++	[0x17] = "TUNNEL_OPTION_HEADER",
++	[0x18] = "MULTICAST_TO_CPU",
++	[0x19] = "MULTICAST_TO_GMAC1_CPU",
++	[0x1a] = "HIT_PRE_BIND",
++	[0x1b] = "PACKET_SAMPLING",
++	[0x1c] = "EXCEED_MTU",
++	[0x1d] = "0x1d",
++	[0x1e] = "PPE_BYPASS",
++	[0x1f] = "INVALID",
++};
++
++static int airoha_ppe_diag_key(struct airoha_gdm_dev *dev)
++{
++	return ((dev->port->id & 3) << 1) |
++		!!test_bit(AIROHA_DEV_F_PON, &dev->flags);
++}
++
++/* State of the FOE entry at hash as the hardware sees it. DRAM entries are
++ * the table itself, SRAM entries need an indirect register read.
++ */
++static int airoha_ppe_diag_entry_state(struct airoha_ppe *ppe, u32 hash)
++{
++	u32 sram_num_entries = airoha_ppe_get_total_sram_num_entries(ppe);
++	struct airoha_foe_entry *hwe;
++	struct airoha_eth *eth = ppe->eth;
++	u32 val;
++	bool ppe2;
++
++	if (hash >= airoha_ppe_get_total_num_entries(ppe))
++		return -EINVAL;
++
++	hwe = ppe->foe + hash * sizeof(*hwe);
++	if (hash >= sram_num_entries)
++		return FIELD_GET(AIROHA_FOE_IB1_BIND_STATE,
++				 READ_ONCE(hwe->ib1));
++
++	ppe2 = hash >= PPE_SRAM_NUM_ENTRIES;
++
++	spin_lock_bh(&ppe_lock);
++	airoha_fe_wr(eth, REG_PPE_RAM_CTRL(ppe2),
++		     FIELD_PREP(PPE_SRAM_CTRL_ENTRY_MASK, hash) |
++		     PPE_SRAM_CTRL_REQ_MASK);
++	if (read_poll_timeout_atomic(airoha_fe_rr, val,
++				     val & PPE_SRAM_CTRL_ACK_MASK,
++				     10, 100, false, eth,
++				     REG_PPE_RAM_CTRL(ppe2))) {
++		spin_unlock_bh(&ppe_lock);
++		return -ETIMEDOUT;
++	}
++	val = airoha_fe_rr(eth, REG_PPE_RAM_ENTRY(ppe2, 0));
++	spin_unlock_bh(&ppe_lock);
++
++	return FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, val);
++}
++
++static u32 airoha_ppe_diag_ib2(const struct airoha_foe_entry *hwe)
++{
++	int type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1);
++
++	if (type == PPE_PKT_TYPE_BRIDGE)
++		return hwe->bridge.ib2;
++	if (type >= PPE_PKT_TYPE_IPV6_ROUTE_3T)
++		return hwe->ipv6.ib2;
++
++	return hwe->ipv4.ib2;
++}
++
++/* Locate the IPv4 header of a frame handed to the RX path. eth_type_trans()
++ * has run, but the network header is not set yet, and PON frames still carry
++ * their 802.1Q tag and PPPoE session header.
++ */
++static const struct iphdr *airoha_ppe_diag_ipv4_hdr(const struct sk_buff *skb)
++{
++	int off = 0, len = skb_headlen(skb) - sizeof(struct iphdr);
++	u16 type = ntohs(skb->protocol);
++
++	while (len - off >= 0) {
++		if (type == ETH_P_IP)
++			return (const struct iphdr *)(skb->data + off);
++
++		if ((type == ETH_P_8021Q || type == ETH_P_8021AD) &&
++		    len - off >= VLAN_HLEN) {
++			type = get_unaligned_be16(skb->data + off + VLAN_HLEN - 2);
++			off += VLAN_HLEN;
++		} else if (type == ETH_P_PPP_SES && len - off >= 8) {
++			type = get_unaligned_be16(skb->data + off + 6);
++			off += 8;	/* session header + PPP protocol */
++			if (type == 0x0021)	/* PPP_IP */
++				type = ETH_P_IP;
++		} else {
++			break;
++		}
++	}
++
++	return NULL;
++}
++
++static void airoha_ppe_diag_trace(struct airoha_ppe *ppe, struct sk_buff *skb,
++				  int key, u32 hash, u32 reason, u32 msg0,
++				  u32 msg1)
++{
++	struct airoha_diag_rec *r;
++	struct airoha_foe_entry *hwe;
++	const struct iphdr *ih = NULL;
++	u8 *l4;
++	int state = AIROHA_DIAG_NO_HASH;
++	u8 *data;
++	u32 left, idx, head, i;
++
++	ih = airoha_ppe_diag_ipv4_hdr(skb);
++
++	if ((ppe->trace_saddr &&
++	     ppe->trace_saddr != (ih ? ih->saddr : 0)) ||
++	    (ppe->trace_daddr &&
++	     ppe->trace_daddr != (ih ? ih->daddr : 0)) ||
++	    (ppe->trace_proto &&
++	     ppe->trace_proto != (ih ? ih->protocol : 0)))
++		return;
++
++	left = READ_ONCE(ppe->trace_left);
++	if (!left)
++		return;
++	WRITE_ONCE(ppe->trace_left, left - 1);
++
++	idx = READ_ONCE(ppe->trace_idx) % AIROHA_DIAG_TRACE_SZ;
++	WRITE_ONCE(ppe->trace_idx, idx + 1);
++	r = &ppe->trace[idx];
++
++	memset(r, 0, sizeof(*r));
++	r->ms = jiffies_to_msecs(jiffies);
++	r->hash = hash;
++	r->reason = reason;
++	r->key = key;
++	r->len = skb->len;
++	r->msg0 = msg0;
++	r->msg1 = msg1;
++
++	if (ih) {
++		r->saddr = ih->saddr;
++		r->daddr = ih->daddr;
++		r->proto = ih->protocol;
++		l4 = (u8 *)ih + ih->ihl * 4;
++		if ((ih->protocol == IPPROTO_TCP ||
++		     ih->protocol == IPPROTO_UDP) &&
++		    l4 + 4 <= skb->data + skb_headlen(skb)) {
++			u32 ports;
++
++			ports = get_unaligned_be32(l4);
++			r->sport = ports >> 16;
++			r->dport = ports & 0xffff;
++		}
++	}
++
++	if (hash < airoha_ppe_get_total_num_entries(ppe)) {
++		hwe = airoha_ppe_foe_get_entry(ppe, hash);
++		if (hwe) {
++			r->ib1 = hwe->ib1;
++			r->ib2 = airoha_ppe_diag_ib2(hwe);
++			state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE,
++					  hwe->ib1);
++		}
++	}
++	r->state = state;
++
++	/* eth_type_trans() already pulled the ethernet header */
++	data = skb->data - ETH_HLEN;
++	head = min_t(u32, AIROHA_DIAG_TRACE_HEAD,
++		     skb_headlen(skb) + ETH_HLEN);
++	for (i = 0; i < head; i++)
++		r->head[i] = data[i];
++}
++
++void airoha_ppe_diag_rx(struct airoha_ppe *ppe, struct airoha_gdm_dev *dev,
++			struct sk_buff *skb, u32 msg0, u32 msg1)
++{
++	struct airoha_rx_diag *d = this_cpu_ptr(&airoha_rx_diag);
++	u32 hash = FIELD_GET(AIROHA_RXD4_FOE_ENTRY, msg1);
++	u32 reason = FIELD_GET(AIROHA_RXD4_PPE_CPU_REASON, msg1);
++	int key = airoha_ppe_diag_key(dev);
++	int state = AIROHA_DIAG_NO_HASH;
++
++	if (!READ_ONCE(ppe->diag_en))
++		return;
++
++	d->pkts[key][reason]++;
++	d->bytes[key][reason] += skb->len;
++
++	if (hash != AIROHA_RXD4_FOE_ENTRY) {
++		state = AIROHA_DIAG_SKIPPED;
++		/* SRAM lookups cost a register round trip: keep one in four */
++		if (hash >= airoha_ppe_get_total_sram_num_entries(ppe) ||
++		    !(d->seq++ & 3)) {
++			state = airoha_ppe_diag_entry_state(ppe, hash);
++			if (state < 0)
++				state = AIROHA_DIAG_NO_HASH;
++		}
++	}
++	d->states[key][reason][state]++;
++
++	if (READ_ONCE(ppe->trace_left))
++		airoha_ppe_diag_trace(ppe, skb, key, hash, reason, msg0,
++				      msg1);
++}
++
++void airoha_ppe_diag_reset(void)
++{
++	struct airoha_rx_diag *d;
++	int cpu;
++
++	for_each_possible_cpu(cpu) {
++		d = per_cpu_ptr(&airoha_rx_diag, cpu);
++		memset(d, 0, sizeof(*d));
++	}
++}
++
++void airoha_ppe_diag_show(struct seq_file *m)
++{
++	static const char *const state_str[AIROHA_DIAG_NUM_STATES] = {
++		"INV", "UNB", "BND", "FIN", "nohash", "skip",
++	};
++	u64 pkts[AIROHA_DIAG_NUM_REASONS];
++	u64 bytes[AIROHA_DIAG_NUM_REASONS];
++	u64 states[AIROHA_DIAG_NUM_REASONS][AIROHA_DIAG_NUM_STATES];
++	struct airoha_ppe *ppe = m->private;
++	struct airoha_rx_diag *d;
++	int cpu, key, reason, state;
++
++	seq_printf(m, "en=%u trace_left=%u\n", READ_ONCE(ppe->diag_en),
++		   READ_ONCE(ppe->trace_left));
++
++	for (key = 0; key < AIROHA_DIAG_NUM_KEYS; key++) {
++		u64 total = 0;
++
++		memset(pkts, 0, sizeof(pkts));
++		memset(bytes, 0, sizeof(bytes));
++		memset(states, 0, sizeof(states));
++		for_each_possible_cpu(cpu) {
++			d = per_cpu_ptr(&airoha_rx_diag, cpu);
++			for (reason = 0; reason < AIROHA_DIAG_NUM_REASONS;
++			     reason++) {
++				pkts[reason] += d->pkts[key][reason];
++				bytes[reason] += d->bytes[key][reason];
++				for (state = 0; state < AIROHA_DIAG_NUM_STATES;
++				     state++)
++					states[reason][state] +=
++						d->states[key][reason][state];
++			}
++		}
++
++		for (reason = 0; reason < AIROHA_DIAG_NUM_REASONS; reason++)
++			total += pkts[reason];
++		if (!total)
++			continue;
++
++		seq_printf(m, "key %d-%s pkts=%llu\n", key >> 1,
++			   key & 1 ? "pon" : "lan", total);
++		for (reason = 0; reason < AIROHA_DIAG_NUM_REASONS; reason++) {
++			if (!pkts[reason])
++				continue;
++
++			seq_printf(m, "  r%02x %-26s pkts=%-9llu bytes=%-11llu",
++				   reason, airoha_diag_reason_str[reason],
++				   pkts[reason], bytes[reason]);
++			for (state = 0; state < AIROHA_DIAG_NUM_STATES;
++			     state++)
++				seq_printf(m, " %s=%llu", state_str[state],
++					   states[reason][state]);
++			seq_putc(m, '\n');
++		}
++	}
++}
++
++void airoha_ppe_diag_trace_show(struct seq_file *m)
++{
++	struct airoha_ppe *ppe = m->private;
++	struct airoha_diag_rec *r;
++	u32 n, i;
++
++	if (!ppe->trace)
++		return;
++
++	n = min_t(u32, READ_ONCE(ppe->trace_idx), AIROHA_DIAG_TRACE_SZ);
++	for (i = 0; i < n; i++) {
++		r = &ppe->trace[i];
++
++		seq_printf(m, "%u %d-%s hash=%04x r%02x st%u %pI4:%u>%pI4:%u "
++			   "pr=%u len=%u ib1=%08x ib2=%08x msg0=%08x "
++			   "msg1=%08x head=%40ph\n",
++			   r->ms, r->key >> 1, r->key & 1 ? "pon" : "lan",
++			   r->hash, r->reason, r->state,
++			   &r->saddr, r->sport, &r->daddr, r->dport,
++			   r->proto, r->len, r->ib1, r->ib2, r->msg0,
++			   r->msg1, r->head);
++	}
++}
++
++int airoha_ppe_diag_reg_write(struct airoha_ppe *ppe, u32 off, u32 mask,
++			      u32 val)
++{
++	if (off >= 0x8000 || (off & 3))
++		return -EINVAL;
++
++	airoha_fe_rmw(ppe->eth, off, mask, val);
++
++	return 0;
++}
++
++int airoha_ppe_diag_npu_init(struct airoha_ppe *ppe,
++			     const struct airoha_npu_hwnat_args *args,
++			     bool deinit)
++{
++	struct airoha_eth *eth = ppe->eth;
++	struct airoha_npu *npu;
++	int err;
++
++	mutex_lock(&flow_offload_mutex);
++
++	npu = rcu_dereference_protected(eth->npu,
++					lockdep_is_held(&flow_offload_mutex));
++	if (!npu) {
++		err = -ENODEV;
++		goto unlock;
++	}
++
++	err = deinit ? npu->ops.ppe_deinit(npu)
++		     : npu->ops.ppe_hwnat_init(npu, args);
++	if (err || deinit)
++		goto unlock;
++
++	err = airoha_ppe_wait_for_npu_init(eth);
++	if (err)
++		goto unlock;
++
++	airoha_ppe_hw_init(ppe);
++unlock:
++	mutex_unlock(&flow_offload_mutex);
++
++	return err;
++}
++
++int airoha_ppe_diag_npu_fw(struct airoha_ppe *ppe, const char *rv32_name,
++			   const char *data_name)
++{
++	struct airoha_npu *npu;
++	int err;
++
++	mutex_lock(&flow_offload_mutex);
++
++	npu = rcu_dereference_protected(ppe->eth->npu,
++					lockdep_is_held(&flow_offload_mutex));
++	if (!npu || !npu->ops.fw_reload) {
++		err = -ENODEV;
++		goto unlock;
++	}
++
++	err = npu->ops.fw_reload(npu, rv32_name, data_name);
++unlock:
++	mutex_unlock(&flow_offload_mutex);
++
++	return err;
++}
++
++int airoha_ppe_diag_foe_read(struct airoha_ppe *ppe, u32 hash, u32 *words)
++{
++	struct airoha_foe_entry *hwe;
++
++	if (hash >= airoha_ppe_get_total_num_entries(ppe))
++		return -EINVAL;
++
++	hwe = airoha_ppe_foe_get_entry(ppe, hash);
++	if (!hwe)
++		return -ETIMEDOUT;
++
++	memcpy(words, hwe->data, sizeof(hwe->data));
++
++	return 0;
++}
++
++int airoha_ppe_diag_foe_write(struct airoha_ppe *ppe, u32 hash, u32 word,
++			      u32 mask, u32 val)
++{
++	u32 sram_num_entries = airoha_ppe_get_total_sram_num_entries(ppe);
++	struct airoha_flow_table_entry *e;
++	struct rhashtable_iter iter;
++	struct airoha_foe_entry *hwe;
++	u32 *w;
++	int err = 0;
++
++	if (hash >= airoha_ppe_get_total_num_entries(ppe) ||
++	    word >= sizeof(struct airoha_foe_entry) / sizeof(u32))
++		return -EINVAL;
++
++	mutex_lock(&flow_offload_mutex);
++
++	/* keep the software copy in sync, or the next stats run detects a
++	 * mismatch and the flow is bound again from scratch
++	 */
++	rhashtable_walk_enter(&ppe->eth->flow_table, &iter);
++	rhashtable_walk_start(&iter);
++	while ((e = rhashtable_walk_next(&iter))) {
++		if (IS_ERR(e))
++			continue;
++		if (e->type != FLOW_TYPE_L4 || e->hash != hash)
++			continue;
++
++		w = (u32 *)&e->data;
++		w[word] = (w[word] & ~mask) | (val & mask);
++	}
++	rhashtable_walk_stop(&iter);
++	rhashtable_walk_exit(&iter);
++
++	spin_lock_bh(&ppe_lock);
++	hwe = airoha_ppe_foe_get_entry_locked(ppe, hash);
++	if (!hwe) {
++		err = -ETIMEDOUT;
++		goto unlock;
++	}
++
++	w = (u32 *)hwe;
++	w[word] = (w[word] & ~mask) | (val & mask);
++
++	if (hash < sram_num_entries)
++		err = airoha_ppe_foe_commit_sram_entry(ppe, hash);
++unlock:
++	spin_unlock_bh(&ppe_lock);
++
++	mutex_unlock(&flow_offload_mutex);
++
++	return err;
++}
++
+ static int airoha_ppe_offload_setup(struct airoha_eth *eth)
+ {
+ 	struct airoha_npu *npu = airoha_ppe_npu_get(eth);
+@@ -1870,6 +2342,12 @@
+ 	if (!ppe->foe_check_time)
+ 		return -ENOMEM;
+ 
++	ppe->diag_en = 1;
++	ppe->trace = devm_kcalloc(eth->dev, AIROHA_DIAG_TRACE_SZ,
++				  sizeof(*ppe->trace), GFP_KERNEL);
++	if (!ppe->trace)
++		return -ENOMEM;
++
+ 	err = airoha_ppe_flush_sram_entries(ppe);
+ 	if (err)
+ 		return err;
+diff -ruN T_base/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c T_new/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -4,6 +4,9 @@
+  * Author: Lorenzo Bianconi <lorenzo@kernel.org>
+  */
+ 
++#include <linux/inet.h>
++#include <net/ip.h>
++
+ #include "airoha_regs.h"
+ #include "airoha_eth.h"
+ 
+@@ -287,6 +290,373 @@
+ 	.release = single_release,
+ 	.write = airoha_ppe_debugfs_bind_rate_write,
+ };
++/* --- diagnostics ------------------------------------------------------- */
++
++static int airoha_ppe_debugfs_copy(char *buf, size_t size,
++				   const char __user *user_buf, size_t count)
++{
++	if (count >= size)
++		return -EINVAL;
++	if (copy_from_user(buf, user_buf, count))
++		return -EFAULT;
++	buf[count] = '\0';
++
++	return 0;
++}
++
++/* seq_file helper exposing ppe as m->private with a write() hook */
++#define AIROHA_PPE_DEBUGFS_RW(name, show, wr)                                \
++static int name##_open(struct inode *inode, struct file *file)              \
++{                                                                            \
++	return single_open(file, show, inode->i_private);                    \
++}                                                                            \
++static const struct file_operations name##_fops = {                          \
++	.owner = THIS_MODULE,                                                 \
++	.open = name##_open,                                                  \
++	.read = seq_read,                                                     \
++	.llseek = seq_lseek,                                                  \
++	.release = single_release,                                            \
++	.write = wr,                                                       \
++}
++
++static int airoha_ppe_debugfs_diag_show(struct seq_file *m, void *private)
++{
++	airoha_ppe_diag_show(m);
++
++	return 0;
++}
++
++static ssize_t airoha_ppe_debugfs_diag_write(struct file *file,
++					     const char __user *user_buf,
++					     size_t count, loff_t *ppos)
++{
++	struct seq_file *m = file->private_data;
++	struct airoha_ppe *ppe = m->private;
++	char buf[32];
++	u32 en;
++	int ret;
++
++	ret = airoha_ppe_debugfs_copy(buf, sizeof(buf), user_buf, count);
++	if (ret)
++		return ret;
++
++	if (!strcmp(buf, "reset\n")) {
++		airoha_ppe_diag_reset();
++	} else if (sscanf(buf, "%u", &en) == 1) {
++		WRITE_ONCE(ppe->diag_en, en ? 1 : 0);
++	} else {
++		return -EINVAL;
++	}
++
++	return count;
++}
++AIROHA_PPE_DEBUGFS_RW(airoha_ppe_debugfs_diag, airoha_ppe_debugfs_diag_show,
++		      airoha_ppe_debugfs_diag_write);
++
++static int airoha_ppe_debugfs_trace_show(struct seq_file *m, void *private)
++{
++	airoha_ppe_diag_trace_show(m);
++
++	return 0;
++}
++
++/* "<src ip|0> <dst ip|0> <tcp|udp|proto num|0> <count>" */
++static ssize_t airoha_ppe_debugfs_trace_write(struct file *file,
++					      const char __user *user_buf,
++					      size_t count, loff_t *ppos)
++{
++	struct seq_file *m = file->private_data;
++	struct airoha_ppe *ppe = m->private;
++	char buf[96], a[20], b[20], pr[20];
++	u32 num, proto = 0;
++	__be32 saddr = 0, daddr = 0;
++	int ret;
++
++	ret = airoha_ppe_debugfs_copy(buf, sizeof(buf), user_buf, count);
++	if (ret)
++		return ret;
++
++	if (sscanf(buf, "%19s %19s %19s %u", a, b, pr, &num) != 4)
++		return -EINVAL;
++
++	if (strcmp(a, "0") &&
++	    !in4_pton(a, -1, (u8 *)&saddr, '\0', NULL))
++		return -EINVAL;
++	if (strcmp(b, "0") &&
++	    !in4_pton(b, -1, (u8 *)&daddr, '\0', NULL))
++		return -EINVAL;
++	if (!strcmp(pr, "tcp")) {
++		proto = IPPROTO_TCP;
++	} else if (!strcmp(pr, "udp")) {
++		proto = IPPROTO_UDP;
++	} else if (strcmp(pr, "0") && sscanf(pr, "%u", &proto) != 1) {
++		return -EINVAL;
++	}
++
++	WRITE_ONCE(ppe->trace_left, 0);
++	ppe->trace_saddr = saddr;
++	ppe->trace_daddr = daddr;
++	ppe->trace_proto = proto;
++	WRITE_ONCE(ppe->trace_idx, 0);
++	WRITE_ONCE(ppe->trace_left, num);
++
++	return count;
++}
++AIROHA_PPE_DEBUGFS_RW(airoha_ppe_debugfs_trace, airoha_ppe_debugfs_trace_show,
++		      airoha_ppe_debugfs_trace_write);
++
++/* "<offset>" selects the register shown on read,
++ * "<offset> <mask> <value>" additionally modifies it. Values are hex.
++ */
++static int airoha_ppe_debugfs_reg_show(struct seq_file *m, void *private)
++{
++	struct airoha_ppe *ppe = m->private;
++	u32 off = READ_ONCE(ppe->reg_off);
++
++	seq_printf(m, "%04x: %08x\n", off, airoha_fe_rr(ppe->eth, off));
++
++	return 0;
++}
++
++static ssize_t airoha_ppe_debugfs_reg_write(struct file *file,
++					    const char __user *user_buf,
++					    size_t count, loff_t *ppos)
++{
++	struct seq_file *m = file->private_data;
++	struct airoha_ppe *ppe = m->private;
++	char buf[96];
++	u32 off, mask = 0, val = 0;
++	int ret;
++
++	ret = airoha_ppe_debugfs_copy(buf, sizeof(buf), user_buf, count);
++	if (ret)
++		return ret;
++
++	ret = sscanf(buf, "%x %x %x", &off, &mask, &val);
++	if (ret != 1 && ret != 3)
++		return -EINVAL;
++
++	WRITE_ONCE(ppe->reg_off, off);
++	if (ret == 3) {
++		ret = airoha_ppe_diag_reg_write(ppe, off, mask, val);
++		if (ret)
++			return ret;
++	}
++
++	return count;
++}
++AIROHA_PPE_DEBUGFS_RW(airoha_ppe_debugfs_reg, airoha_ppe_debugfs_reg_show,
++		      airoha_ppe_debugfs_reg_write);
++
++static int airoha_ppe_debugfs_regdump_show(struct seq_file *m, void *private)
++{
++	struct airoha_ppe *ppe = m->private;
++	struct airoha_eth *eth = ppe->eth;
++	int i, j;
++
++#define P(__name, __off)                                                     \
++	seq_printf(m, "%-22s %04x: %08x\n", __name, __off,                   \
++		   airoha_fe_rr(eth, __off))
++
++	P("fe_dma_glo_cfg", REG_FE_DMA_GLO_CFG);
++	P("fe_wan_port", REG_FE_WAN_PORT);
++	P("fe_lan_mac_h", REG_FE_LAN_MAC_H);
++	P("fe_wan_mac_h", REG_FE_WAN_MAC_H);
++	P("fe_pce_cfg", REG_FE_PCE_CFG);
++	P("gdm_misc_cfg", REG_GDM_MISC_CFG);
++	P("csr_ifc_cfg", REG_FE_CSR_IFC_CFG);
++	P("vip_port_en", REG_FE_VIP_PORT_EN);
++	P("ifc_port_en", REG_FE_IFC_PORT_EN);
++	P("ip_frag_fp", REG_IP_FRAG_FP);
++	P("mc_vlan_en", REG_MC_VLAN_EN);
++	P("fe_0e8c", 0x0e8c);
++	P("fe_cport_cfg", REG_FE_CPORT_CFG);
++
++	for (i = 1; i <= 2; i++) {
++		P("cdm_fwd_cfg", REG_CDM_FWD_CFG(i));
++		for (j = 0; j < 6; j++)
++			seq_printf(m, "cdm%d_crsn_qsel%d        %04x: %08x\n",
++				   i, j, REG_CDM_CRSN_QSEL(i, j),
++				   airoha_fe_rr(eth, REG_CDM_CRSN_QSEL(i, j)));
++	}
++
++	for (i = 0; i < eth->soc->num_ppe; i++) {
++		P("ppe_glo_cfg", REG_PPE_GLO_CFG(i));
++		P("ppe_flow_cfg", REG_PPE_PPE_FLOW_CFG(i));
++		P("ppe_ip_proto_chk", REG_PPE_IP_PROTO_CHK(i));
++		P("ppe_tb_cfg", REG_PPE_TB_CFG(i));
++		P("ppe_tb_base", REG_PPE_TB_BASE(i));
++		P("ppe_bind_rate", REG_PPE_BIND_RATE(i));
++		P("ppe_bind_limit0", REG_PPE_BIND_LIMIT0(i));
++		P("ppe_bind_limit1", REG_PPE_BIND_LIMIT1(i));
++		P("ppe_unbind_age", REG_PPE_UNBIND_AGE(i));
++		P("ppe_bnd_age0", REG_PPE_BND_AGE0(i));
++		P("ppe_bnd_age1", REG_PPE_BND_AGE1(i));
++		P("ppe_hash_seed", REG_PPE_HASH_SEED(i));
++		P("ppe_dft_cport0", REG_PPE_DFT_CPORT(i, 0));
++		P("ppe_dft_cport1", REG_PPE_DFT_CPORT(i, 8));
++		P("ppe_tb_hash_cfg", REG_PPE_TB_HASH_CFG(i));
++		for (j = 0; j < 4; j++)
++			seq_printf(m, "ppe%d_mtu%d               %04x: %08x\n",
++				   i, j * 2, REG_PPE_MTU(i, j * 2),
++				   airoha_fe_rr(eth, REG_PPE_MTU(i, j * 2)));
++	}
++
++	for (i = 1; i <= AIROHA_MAX_NUM_GDM_PORTS; i++) {
++		seq_printf(m, "-- gdm%d\n", i);
++		P("gdm_fwd_cfg", REG_GDM_FWD_CFG(i));
++		P("gdm_ingress_cfg", REG_GDM_INGRESS_CFG(i));
++		P("gdm_len_cfg", REG_GDM_LEN_CFG(i));
++		P("gdm_lpbk_cfg", REG_GDM_LPBK_CFG(i));
++		P("gdm_chn_rls", REG_GDM_CHN_RLS(i));
++		P("gdm_txchn_en", REG_GDM_TXCHN_EN(i));
++		P("gdm_rxchn_en", REG_GDM_RXCHN_EN(i));
++		seq_printf(m, "gdm_tx_ok_pkts           %llu\n",
++			   ((u64)airoha_fe_rr(eth, REG_FE_GDM_TX_OK_PKT_CNT_H(i)) << 32) |
++			   airoha_fe_rr(eth, REG_FE_GDM_TX_OK_PKT_CNT_L(i)));
++		seq_printf(m, "gdm_tx_ok_bytes          %llu\n",
++			   ((u64)airoha_fe_rr(eth, REG_FE_GDM_TX_OK_BYTE_CNT_H(i)) << 32) |
++			   airoha_fe_rr(eth, REG_FE_GDM_TX_OK_BYTE_CNT_L(i)));
++		seq_printf(m, "gdm_rx_ok_pkts           %llu\n",
++			   ((u64)airoha_fe_rr(eth, REG_FE_GDM_RX_OK_PKT_CNT_H(i)) << 32) |
++			   airoha_fe_rr(eth, REG_FE_GDM_RX_OK_PKT_CNT_L(i)));
++		seq_printf(m, "gdm_rx_ok_bytes          %llu\n",
++			   ((u64)airoha_fe_rr(eth, REG_FE_GDM_RX_OK_BYTE_CNT_H(i)) << 32) |
++			   airoha_fe_rr(eth, REG_FE_GDM_RX_OK_BYTE_CNT_L(i)));
++	}
++
++#undef P
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(airoha_ppe_debugfs_regdump);
++
++/* "<hash>" selects the entry shown on read,
++ * "<hash> <word> <mask> <value>" additionally modifies it. Values are hex.
++ */
++static int airoha_ppe_debugfs_foe_raw_show(struct seq_file *m, void *private)
++{
++	struct airoha_ppe *ppe = m->private;
++	u32 words[sizeof(struct airoha_foe_entry) / sizeof(u32)];
++	u32 hash = READ_ONCE(ppe->reg_off);
++	int err, i;
++
++	err = airoha_ppe_diag_foe_read(ppe, hash, words);
++	if (err)
++		return err;
++
++	seq_printf(m, "%05x:", hash);
++	for (i = 0; i < ARRAY_SIZE(words); i++)
++		seq_printf(m, " %08x", words[i]);
++	seq_putc(m, '\n');
++
++	return 0;
++}
++
++static ssize_t airoha_ppe_debugfs_foe_raw_write(struct file *file,
++						const char __user *user_buf,
++						size_t count, loff_t *ppos)
++{
++	struct seq_file *m = file->private_data;
++	struct airoha_ppe *ppe = m->private;
++	char buf[96];
++	u32 hash, word = 0, mask = 0, val = 0;
++	int ret;
++
++	ret = airoha_ppe_debugfs_copy(buf, sizeof(buf), user_buf, count);
++	if (ret)
++		return ret;
++
++	ret = sscanf(buf, "%x %u %x %x", &hash, &word, &mask, &val);
++	if (ret != 1 && ret != 4)
++		return -EINVAL;
++
++	WRITE_ONCE(ppe->reg_off, hash);
++	if (ret == 4) {
++		ret = airoha_ppe_diag_foe_write(ppe, hash, word, mask, val);
++		if (ret)
++			return ret;
++	}
++
++	return count;
++}
++AIROHA_PPE_DEBUGFS_RW(airoha_ppe_debugfs_foe_raw,
++		      airoha_ppe_debugfs_foe_raw_show,
++		      airoha_ppe_debugfs_foe_raw_write);
++
++/* "<wan_mode> <ppe_type> <wan_sel> <max_packet> <cds> <xpon_hal_api>
++ *  <wan_xsi> <ct_joyme4>" re-runs the NPU HWNAT init (missing values keep
++ * the driver defaults), "deinit" runs the NPU HWNAT deinit.
++ */
++static ssize_t airoha_ppe_debugfs_npu_init_write(struct file *file,
++						 const char __user *user_buf,
++						 size_t count, loff_t *ppos)
++{
++	struct seq_file *m = file->private_data;
++	struct airoha_ppe *ppe = m->private;
++	struct airoha_npu_hwnat_args args = {};
++	char buf[128];
++	/* driver defaults, see airoha_npu_ppe_init() */
++	u32 v[8] = { QDMA_WAN_ETHER, PPE_TYPE_L2B_IPV4_IPV6, };
++	bool deinit;
++	int ret, n;
++
++	ret = airoha_ppe_debugfs_copy(buf, sizeof(buf), user_buf, count);
++	if (ret)
++		return ret;
++
++	deinit = !strcmp(buf, "deinit\n");
++	if (!deinit) {
++		n = sscanf(buf, "%u %u %u %u %u %u %u %u", &v[0], &v[1],
++			   &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]);
++		if (n < 1)
++			return -EINVAL;
++
++		args.wan_mode = v[0];
++		args.ppe_type = v[1];
++		args.wan_sel = v[2];
++		args.max_packet = v[3];
++		args.cds = v[4];
++		args.xpon_hal_api = v[5];
++		args.wan_xsi = v[6];
++		args.ct_joyme4 = v[7];
++	}
++
++	ret = airoha_ppe_diag_npu_init(ppe, &args, deinit);
++	if (ret)
++		return ret;
++
++	return count;
++}
++AIROHA_PPE_DEBUGFS_RW(airoha_ppe_debugfs_npu_init, airoha_ppe_debugfs_regdump_show,
++		      airoha_ppe_debugfs_npu_init_write);
++
++/* "<rv32 image> <data image>": images below /lib/firmware/ */
++static ssize_t airoha_ppe_debugfs_npu_fw_write(struct file *file,
++					       const char __user *user_buf,
++					       size_t count, loff_t *ppos)
++{
++	struct seq_file *m = file->private_data;
++	struct airoha_ppe *ppe = m->private;
++	char buf[192], rv32[96], data[96];
++	int ret;
++
++	ret = airoha_ppe_debugfs_copy(buf, sizeof(buf), user_buf, count);
++	if (ret)
++		return ret;
++
++	if (sscanf(buf, "%95s %95s", rv32, data) != 2)
++		return -EINVAL;
++
++	ret = airoha_ppe_diag_npu_fw(ppe, rv32, data);
++	if (ret)
++		return ret;
++
++	return count;
++}
++AIROHA_PPE_DEBUGFS_RW(airoha_ppe_debugfs_npu_fw, airoha_ppe_debugfs_regdump_show,
++		      airoha_ppe_debugfs_npu_fw_write);
++
+ 
+ int airoha_ppe_debugfs_init(struct airoha_ppe *ppe)
+ {
+@@ -299,6 +669,20 @@
+ 			    &airoha_ppe_debugfs_foe_all_fops);
+ 	debugfs_create_file("bind", 0444, ppe->debugfs_dir, ppe,
+ 			    &airoha_ppe_debugfs_foe_bind_fops);
++	debugfs_create_file("diag", 0644, ppe->debugfs_dir, ppe,
++			    &airoha_ppe_debugfs_diag_fops);
++	debugfs_create_file("trace", 0644, ppe->debugfs_dir, ppe,
++			    &airoha_ppe_debugfs_trace_fops);
++	debugfs_create_file("reg", 0644, ppe->debugfs_dir, ppe,
++			    &airoha_ppe_debugfs_reg_fops);
++	debugfs_create_file("regdump", 0444, ppe->debugfs_dir, ppe,
++			    &airoha_ppe_debugfs_regdump_fops);
++	debugfs_create_file("foe", 0644, ppe->debugfs_dir, ppe,
++			    &airoha_ppe_debugfs_foe_raw_fops);
++	debugfs_create_file("npu_init", 0600, ppe->debugfs_dir, ppe,
++			    &airoha_ppe_debugfs_npu_init_fops);
++	debugfs_create_file("npu_fw", 0600, ppe->debugfs_dir, ppe,
++			    &airoha_ppe_debugfs_npu_fw_fops);
+ 
+ 	return 0;
+ }
+diff -ruN T_base/include/linux/soc/airoha/airoha_offload.h T_new/include/linux/soc/airoha/airoha_offload.h
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -163,6 +163,18 @@
+ 	WLAN_FUNC_GET_WAIT_NPU_VERSION,
+ };
+ 
++/* Parameters of the NPU HWNAT init mailbox message. */
++struct airoha_npu_hwnat_args {
++	u32 wan_mode;		/* 1: QDMA WAN ethernet, 2: QDMA WAN PON/xDSL */
++	u32 ppe_type;		/* 2: L2B IPv4, 3: L2B IPv4/IPv6 */
++	u32 wan_sel;
++	u8 max_packet;
++	u8 cds;
++	u8 xpon_hal_api;
++	u8 wan_xsi;
++	u8 ct_joyme4;
++};
++
+ struct airoha_npu {
+ #if (IS_BUILTIN(CONFIG_NET_AIROHA_NPU) || IS_MODULE(CONFIG_NET_AIROHA_NPU))
+ 	struct device *dev;
+@@ -185,6 +197,10 @@
+ 	struct {
+ 		int (*ppe_init)(struct airoha_npu *npu);
+ 		int (*ppe_deinit)(struct airoha_npu *npu);
++		int (*ppe_hwnat_init)(struct airoha_npu *npu,
++				      const struct airoha_npu_hwnat_args *args);
++		int (*fw_reload)(struct airoha_npu *npu, const char *rv32_name,
++				 const char *data_name);
+ 		int (*ppe_init_stats)(struct airoha_npu *npu,
+ 				      dma_addr_t addr, u32 num_stats_entries);
+ 		int (*ppe_flush_sram_entries)(struct airoha_npu *npu,
