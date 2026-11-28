@@ -1,0 +1,196 @@
+Subject: [PATCH] net: airoha: report FOE table occupancy in debugfs
+
+There is no register that says how full the FOE table is, and the existing
+entries/bind files cannot answer it cheaply: both walk every index through
+airoha_ppe_foe_get_entry(), which takes ppe_lock and disables bottom halves
+once per entry, then format a line for each. On a 13k-entry table that costs
+1.1-1.4s and strobes the softirq path ~32768 times, so nothing that polls it
+at a few seconds interval can afford it.
+
+Add ppe/usage, which counts instead of printing: it reads ib1 with READ_ONCE,
+without the lock, because a tagged word only changes value under us and a
+one-state-stale count is fine for an occupancy figure. The loop yields every
+4096 entries and the result is cached for 30s, so the cost paid by readers is
+one count per TTL rather than one per request. Writing anything to the file
+drops the cache to force a recount.
+
+The reported total is the number of entries the hardware can actually use,
+SRAM plus DRAM table, not the size of the software index space: on a
+single-PPE SoC the DRAM table starts at index 0x4000, leaving 8k indices in
+between that the hardware never writes. Counting that hole as capacity would
+understate the occupancy.
+
+Output: "used=<all occupied> bound=<in BIND state> total=<usable>".
+
+Signed-off-by: zhoufl <zhoufl@localhost>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -519,6 +519,12 @@
+ 	u64 packets;
+ };
+ 
++struct airoha_ppe_usage {
++	u32 used;
++	u32 bound;
++	u32 total;
++};
++
+ struct airoha_flow_data {
+ 	struct ethhdr eth;
+ 
+@@ -911,6 +917,8 @@
+ 						  u32 hash);
+ void airoha_ppe_foe_entry_get_stats(struct airoha_ppe *ppe, u32 hash,
+ 				    struct airoha_foe_stats64 *stats);
++void airoha_ppe_foe_count_usage(struct airoha_ppe *ppe,
++				 struct airoha_ppe_usage *usage);
+ 
+ struct airoha_flow_table_entry;
+ struct seq_file;
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -871,6 +871,63 @@
+ 	return hwe;
+ }
+ 
++/* Count how many FOE entries the hardware currently occupies.
++ *
++ * This deliberately does not go through airoha_ppe_foe_get_entry(): that
++ * takes ppe_lock and disables bottom halves, and walking the table means
++ * doing it once per index (~32k times), which both perturbs the softirq
++ * path and takes over a second. ib1 is a naturally aligned 32-bit word that
++ * only the hardware rewrites, so a plain READ_ONCE gives a value that may be
++ * one state change stale, which is fine for an occupancy figure.
++ *
++ * The table sits in DMA coherent memory, so every read still walks the bus:
++ * 24k of them take a few milliseconds. Callers must cache the result and
++ * only call this from process context.
++ */
++void airoha_ppe_foe_count_usage(struct airoha_ppe *ppe,
++				struct airoha_ppe_usage *usage)
++{
++	u32 sram_num_entries = airoha_ppe_get_total_sram_num_entries(ppe);
++	struct airoha_foe_entry *foe = ppe->foe;
++	u32 used = 0, bound = 0, i;
++
++	/* The PPE indexes one flat space: SRAM entries first, then the DRAM
++	 * table at PPE_DRAM_IDX_BASE. The gap in between is never written by
++	 * the hardware on a single-PPE SoC, so it must not count as usable.
++	 */
++	usage->total = sram_num_entries + PPE_DRAM_NUM_ENTRIES;
++
++	for (i = 0; i < sram_num_entries; i++) {
++		u32 ib1 = READ_ONCE(foe[i].ib1);
++		u32 state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, ib1);
++
++		if (!state)
++			continue;
++		used++;
++		if (state == AIROHA_FOE_STATE_BIND)
++			bound++;
++		if (!(i & 0xfff))
++			cond_resched();
++	}
++
++	for (i = PPE_DRAM_IDX_BASE;
++	     i < PPE_DRAM_IDX_BASE + PPE_DRAM_NUM_ENTRIES; i++) {
++		u32 ib1 = READ_ONCE(foe[i].ib1);
++		u32 state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, ib1);
++
++		if (!state)
++			continue;
++		used++;
++		if (state == AIROHA_FOE_STATE_BIND)
++			bound++;
++		if (!(i & 0xfff))
++			cond_resched();
++	}
++
++	usage->used = used;
++	usage->bound = bound;
++}
++
+ static bool airoha_ppe_foe_compare_entry(struct airoha_flow_table_entry *e,
+ 					 struct airoha_foe_entry *hwe)
+ {
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -658,6 +658,68 @@
+ 		      airoha_ppe_debugfs_npu_fw_write);
+ 
+ 
++
++/* Recounting costs a few milliseconds because the FOE table is uncached DMA
++ * memory. LuCI polls the overview page every few seconds and the occupancy
++ * moves on a scale of minutes, so keep the answer for a while instead of
++ * paying for it on every request.
++ */
++#define AIROHA_PPE_USAGE_TTL	(30 * HZ)
++
++static DEFINE_MUTEX(airoha_ppe_usage_lock);
++static unsigned long airoha_ppe_usage_expires;
++static struct airoha_ppe_usage airoha_ppe_usage_cache;
++
++static int airoha_ppe_debugfs_usage_show(struct seq_file *m, void *private)
++{
++	struct airoha_ppe *ppe = m->private;
++	struct airoha_ppe_usage u;
++
++	mutex_lock(&airoha_ppe_usage_lock);
++	if (!airoha_ppe_usage_expires ||
++	    time_is_before_jiffies(airoha_ppe_usage_expires)) {
++		airoha_ppe_foe_count_usage(ppe, &airoha_ppe_usage_cache);
++		airoha_ppe_usage_expires = jiffies + AIROHA_PPE_USAGE_TTL;
++	}
++	u = airoha_ppe_usage_cache;
++	mutex_unlock(&airoha_ppe_usage_lock);
++
++	seq_printf(m, "used=%u bound=%u total=%u\n", u.used, u.bound,
++		   u.total);
++
++	return 0;
++}
++
++static int airoha_ppe_debugfs_usage_open(struct inode *inode,
++					 struct file *file)
++{
++	return single_open(file, airoha_ppe_debugfs_usage_show,
++			   inode->i_private);
++}
++
++/* Writing anything drops the cached value, so a fresh count can be forced
++ * while tuning without waiting for the TTL to expire.
++ */
++static ssize_t airoha_ppe_debugfs_usage_write(struct file *file,
++					      const char __user *buf,
++					      size_t len, loff_t *ppos)
++{
++	mutex_lock(&airoha_ppe_usage_lock);
++	airoha_ppe_usage_expires = 0;
++	mutex_unlock(&airoha_ppe_usage_lock);
++
++	return len;
++}
++
++static const struct file_operations airoha_ppe_debugfs_usage_fops = {
++	.owner		= THIS_MODULE,
++	.open		= airoha_ppe_debugfs_usage_open,
++	.read		= seq_read,
++	.write		= airoha_ppe_debugfs_usage_write,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++
+ int airoha_ppe_debugfs_init(struct airoha_ppe *ppe)
+ {
+ 	ppe->debugfs_dir = debugfs_create_dir("ppe", NULL);
+@@ -669,6 +731,8 @@
+ 			    &airoha_ppe_debugfs_foe_all_fops);
+ 	debugfs_create_file("bind", 0444, ppe->debugfs_dir, ppe,
+ 			    &airoha_ppe_debugfs_foe_bind_fops);
++	debugfs_create_file("usage", 0644, ppe->debugfs_dir, ppe,
++			    &airoha_ppe_debugfs_usage_fops);
+ 	debugfs_create_file("diag", 0644, ppe->debugfs_dir, ppe,
+ 			    &airoha_ppe_debugfs_diag_fops);
+ 	debugfs_create_file("trace", 0644, ppe->debugfs_dir, ppe,
