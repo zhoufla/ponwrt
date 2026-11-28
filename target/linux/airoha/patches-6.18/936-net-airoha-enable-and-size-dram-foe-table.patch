@@ -1,0 +1,79 @@
+Subject: [PATCH] net: airoha: enable and size the PPE DRAM FOE table
+
+airoha_ppe_hw_init() programs REG_PPE_TB_HASH_CFG with the DRAM hash modes
+but leaves PPE_DRAM_TABLE_EN cleared, so the PPE only searches the
+8192-entry SRAM table while the 16384-entry DRAM table allocated next to it
+is never used. With 8192 effective slots a PCDN workload of more than 8k
+concurrent sessions saturates the table and keeps churning the slow path.
+
+Set PPE_DRAM_TABLE_EN so the full 24576-entry table is searched, and size
+the software array for the hardware index space rather than for the usable
+entry count: the PPE addresses the SRAM of every PPE first and then the DRAM
+table, so on the single-PPE AN7583 the DRAM window starts at index 0x4000
+and leaves an 8K hole. An array sized for 24576 entries lets the hardware
+write at indices 0x6000-0x7fff past the end of the buffer.
+
+Zero the whole DRAM part of that buffer during the initial flush so stale
+data can never be interpreted as a valid binding.
+
+Verified on the Nokia XG-040G-MF: ppe/foe reads up to 0x7fff, flows hashed
+into 0x6000-0x7fff resolve to the matching A[hash] entry, and every reason
+row in ppe/diag reports nohash=0 under a full PCDN load.
+
+Signed-off-by: zhoufl <zhoufl@localhost>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -68,6 +68,12 @@
+ #define PPE_SRAM_NUM_ENTRIES		(8 * 1024)
+ #define PPE_STATS_NUM_ENTRIES		(4 * 1024)
+ #define PPE_DRAM_NUM_ENTRIES		(16 * 1024)
++/* The PPE addresses its tables through one flat index space: the SRAM of
++ * every PPE first, then the DRAM table. EN7581 has two PPEs (16K entries of
++ * SRAM) so the DRAM table starts at index 0x4000, which leaves an unused 8K
++ * hole on the single-PPE AN7583.
++ */
++#define PPE_DRAM_IDX_BASE		0x4000
+ #define PPE_ENTRY_SIZE			80
+ #define PPE_RAM_NUM_ENTRIES_SHIFT(_n)	(__ffs((_n) >> 10))
+ 
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -75,7 +75,12 @@
+ {
+ 	u32 sram_num_entries = airoha_ppe_get_total_sram_num_entries(ppe);
+ 
+-	return sram_num_entries + PPE_DRAM_NUM_ENTRIES;
++	/* Size the table for the hardware index space, not for the number of
++	 * usable entries: the PPE indexes the DRAM table relative to
++	 * REG_PPE_TB_BASE, so an undersized table makes it write entries past
++	 * the end of the buffer.
++	 */
++	return max(sram_num_entries, PPE_DRAM_IDX_BASE + PPE_DRAM_NUM_ENTRIES);
+ }
+ 
+ bool airoha_ppe_is_enabled(struct airoha_eth *eth, int index)
+@@ -182,6 +182,7 @@
+ 			      FIELD_PREP(PPE_SRAM_TABLE_EN_MASK, 1) |
+ 			      FIELD_PREP(PPE_SRAM_HASH1_EN_MASK, 1) |
+ 			      FIELD_PREP(PPE_SRAM_HASH1_MODE_MASK, 1) |
++			      FIELD_PREP(PPE_DRAM_TABLE_EN_MASK, 1) |
+ 			      FIELD_PREP(PPE_DRAM_HASH1_MODE_MASK, 3));
+ 
+ 		airoha_fe_rmw(eth, REG_PPE_TB_CFG(i),
+@@ -1613,6 +1614,15 @@
+ 			return err;
+ 	}
+ 
++	/* The PPE indexes the DRAM table relative to REG_PPE_TB_BASE, so the
++	 * buffer has to cover the whole hardware index space, not just the
++	 * usable entries. Zero all of it so stale data past the SRAM window
++	 * can never look like a valid binding.
++	 */
++	memset(hwe + sram_num_entries, 0,
++	       (airoha_ppe_get_total_num_entries(ppe) - sram_num_entries) *
++	       sizeof(*hwe));
++
+ 	return 0;
+ }
+ 
