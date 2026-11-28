@@ -20,8 +20,8 @@ sys=$2
 # Do NOT derive this from ppe/diag: that histogram only sees the packets that
 # were delivered to the CPU in the first place, so its BND share (typically
 # 1-3%) measures exception traffic, not offload. And do not walk ppe/bind or
-# ppe/entries either: both take bottom halves down once per entry (~2.2s on a
-# 20k-entry table) and stall softirqs while the PPE is busy.
+# ppe/entries either: both take bottom halves down once per entry (~1.1s on a
+# 13k-entry table) and stall softirqs while the PPE is busy.
 DATAPATH="/sys/kernel/debug/airoha-xpon-pon0/datapath"
 TX_FILE="/sys/class/net/pon0/statistics/tx_packets"
 
@@ -34,8 +34,24 @@ if [ -r "$DATAPATH" ] && [ -r "$TX_FILE" ]; then
 	esac
 fi
 
+# FOE table occupancy, from the counter the driver caches for 30s (939).
+# This is the headroom left for the bind_rate=4 setting: the table filling up
+# is what makes the offload ratio collapse, so it belongs next to it.
+USAGE_FILE="/sys/kernel/debug/ppe/usage"
+
+if [ -r "$USAGE_FILE" ]; then
+	usage=$(cat "$USAGE_FILE" 2>/dev/null)
+	foe_used=${usage#*used=}; foe_used=${foe_used%% *}
+	foe_total=${usage#*total=}
+	case "$foe_used$foe_total" in
+	''|*[!0-9]*) ;;
+	*) [ "$foe_total" -gt 0 ] && \
+		foe=" FOE: ${foe_used}/${foe_total}" ;;
+	esac
+fi
+
 if [ -n "$ratio" ]; then
-	echo -n "USR: ${usr:-N/A} SYS: ${sys:-N/A} PPE: ${ratio}% hw"
+	echo -n "USR: ${usr:-N/A} SYS: ${sys:-N/A} PPE: ${ratio}% hw${foe}"
 else
-	echo -n "USR: ${usr:-N/A} SYS: ${sys:-N/A}"
+	echo -n "USR: ${usr:-N/A} SYS: ${sys:-N/A}${foe}"
 fi
